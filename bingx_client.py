@@ -93,11 +93,7 @@ def get_price(symbol: str) -> float:
     return float(price)
 
 
-def get_klines(symbol: str, interval: str, limit: int) -> pd.DataFrame:
-    data = _get(
-        "/openApi/swap/v3/quote/klines",
-        {"symbol": symbol, "interval": interval, "limit": limit},
-    )
+def _parse_klines(data: Any, symbol: str, interval: str) -> pd.DataFrame:
     if not data:
         raise NoDataError(f"BingX не вернул свечи {interval} для {symbol}.")
 
@@ -117,6 +113,26 @@ def get_klines(symbol: str, interval: str, limit: int) -> pd.DataFrame:
     if df.empty:
         raise NoDataError(f"После обработки свечей {interval} для {symbol} данных не осталось.")
     return df
+
+
+def get_klines(symbol: str, interval: str, limit: int) -> pd.DataFrame:
+    data = _get(
+        "/openApi/swap/v3/quote/klines",
+        {"symbol": symbol, "interval": interval, "limit": limit},
+    )
+    return _parse_klines(data, symbol, interval)
+
+
+def get_klines_range(symbol: str, interval: str, start_ms: int, end_ms: int, limit: int = 1440) -> pd.DataFrame:
+    """Candles for an explicit historical window — used to reconstruct the
+    price path after a prediction was made (see `outcome_simulator.py`),
+    unlike `get_klines` which always returns the most recent N candles.
+    """
+    data = _get(
+        "/openApi/swap/v3/quote/klines",
+        {"symbol": symbol, "interval": interval, "startTime": start_ms, "endTime": end_ms, "limit": limit},
+    )
+    return _parse_klines(data, symbol, interval)
 
 
 def get_orderbook(symbol: str, depth: int) -> dict[str, list[list[float]]]:

@@ -52,17 +52,25 @@ OI_HISTORY_FILE = Path(__file__).resolve().parent / "oi_history.jsonl"
 OI_HISTORY_MAX_ENTRIES = int(os.getenv("OI_HISTORY_MAX_ENTRIES", "500"))
 
 # Prediction accuracy tracking (see prediction_tracker.py). Every real (ok)
-# AI verdict is logged with the price at prediction time; once `horizon`
-# seconds have passed since a given prediction, the next snapshot fetch
-# scores it by comparing price movement against the called direction. This
-# is directional-only (did price move the right way by the deadline) — it
-# does not simulate whether stop loss/take profit would have been hit first.
+# AI verdict is logged with its trade plan; once `horizon` seconds have
+# passed since a given prediction, the next snapshot fetch walks the actual
+# BingX candle path over that window (outcome_simulator.py) to see whether
+# stop loss or a take profit was hit first — not just whether price ended up
+# higher/lower at a fixed deadline.
 PREDICTION_HISTORY_FILE = Path(__file__).resolve().parent / "predictions.jsonl"
 PREDICTION_HORIZON_SECONDS = {
     "scalping": int(os.getenv("PREDICTION_HORIZON_SCALPING_SECONDS", str(30 * 60))),
     "swing": int(os.getenv("PREDICTION_HORIZON_SWING_SECONDS", str(8 * 3600))),
 }
 PREDICTION_HISTORY_MAX_ENTRIES = int(os.getenv("PREDICTION_HISTORY_MAX_ENTRIES", "2000"))
+
+# Outcome simulation (see outcome_simulator.py): fixed round-trip cost
+# assumptions used to convert a raw price move into an R-multiple, since we
+# have no access to a real account's actual fee tier/fill quality.
+TRADING_COMMISSION_PCT = float(os.getenv("TRADING_COMMISSION_PCT", "0.0005"))  # 0.05% per side
+TRADING_SLIPPAGE_PCT = float(os.getenv("TRADING_SLIPPAGE_PCT", "0.0002"))  # 0.02%
+OUTCOME_KLINE_INTERVAL = os.getenv("OUTCOME_KLINE_INTERVAL", "1m").strip()
+MIN_SAMPLE_FOR_STATS = int(os.getenv("MIN_SAMPLE_FOR_STATS", "3"))
 
 # AI analysis (optional): up to 3 OpenAI-compatible chat-completions APIs used
 # to analyze the market snapshot automatically and compare their signals side
@@ -102,6 +110,13 @@ DASHBOARD_PORT = int(os.getenv("DASHBOARD_PORT", "47913"))
 # change) and re-serve the last known results without re-fetching BingX or
 # re-querying any AI model, so a restart never costs API quota by itself.
 DASHBOARD_CACHE_FILE = Path(__file__).resolve().parent / "dashboard_cache.pkl"
+
+# Stamped onto every AI call's log entries (see app_log.py) so historical
+# stats/logs can later be filtered by which prompt/schema produced them —
+# bump PROMPT_VERSION whenever SYSTEM_PROMPTS/JSON_INSTRUCTIONS changes
+# meaningfully, and SCHEMA_VERSION whenever ai_schema.TradePlan's shape does.
+PROMPT_VERSION = "v2-json-schema"
+SCHEMA_VERSION = 1
 
 
 @dataclass(frozen=True)

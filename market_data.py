@@ -27,9 +27,10 @@ def fetch_snapshot(symbol_input: str, log: Logger = lambda msg: None) -> dict:
     log(f"Получаю текущую цену {bingx_symbol}...")
     current_price = bingx_client.get_price(bingx_symbol)
 
-    # Score any past predictions whose horizon has elapsed using this fresh
-    # price, before any new predictions get made this round.
-    prediction_tracker.evaluate_due(current_price)
+    # Score any past predictions whose horizon has elapsed by walking the
+    # real BingX candle path over their window, before any new predictions
+    # get made this round.
+    prediction_tracker.evaluate_due(bingx_symbol)
 
     timeframes: dict = {}
     klines_by_tf: dict = {}

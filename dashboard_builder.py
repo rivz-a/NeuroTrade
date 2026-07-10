@@ -13,14 +13,17 @@ avoid any injection from untrusted model output.
 from __future__ import annotations
 
 import html
-import re
+import time
 from datetime import datetime, timezone
 
 import config
 import prediction_tracker
 from ai_client import AIAnalysisResult
+from ai_schema import TradePlan
+from consensus_engine import ConsensusResult, compute_consensus
 from report_builder import MODE_LABELS
-from verdict import detect_signal, extract_verdict
+from signal_freshness import Freshness, compute_freshness, format_age, format_remaining
+from trade_validator import ValidationIssue, ValidationResult
 
 # Fixed categorical order (dataviz skill: never cycled, never reassigned by rank).
 _SLOT_COLORS_LIGHT = ["#2a78d6", "#4a3aa7", "#1baf7a"]  # blue, violet, aqua
@@ -38,48 +41,44 @@ _SIGNAL_VERB = {
     "WAIT": "Не входи (WAIT)",
 }
 
+_ENTRY_STATUS_LABELS = {
+    "ENTER_NOW": "Входить сейчас",
+    "WAIT_PULLBACK": "Ждать откат",
+    "WAIT_BREAKOUT": "Ждать пробой",
+    "WAIT_CONFIRMATION": "Ждать подтверждение",
+    "LATE_ENTRY": "Поздний вход",
+    "REJECTED": "Вход запрещён валидатором",
+    "NO_TRADE": "Нет сделки",
+}
 
-def _markdown_lite_to_html(text: str) -> str:
-    """Very small, safe subset of markdown -> HTML. Input must already be escaped."""
-    lines = text.split("\n")
-    out: list[str] = []
-    in_list = False
-    for raw_line in lines:
-        line = raw_line.strip()
-        if line.startswith("### "):
-            if in_list:
-                out.append("</ul>")
-                in_list = False
-            out.append(f"<h4>{line[4:]}</h4>")
-        elif line.startswith("## "):
-            if in_list:
-                out.append("</ul>")
-                in_list = False
-            out.append(f"<h4>{line[3:]}</h4>")
-        elif line.startswith("- ") or line.startswith("* "):
-            if not in_list:
-                out.append("<ul>")
-                in_list = True
-            out.append(f"<li>{line[2:]}</li>")
-        elif line == "":
-            if in_list:
-                out.append("</ul>")
-                in_list = False
-        elif line in ("---", "***", "___"):
-            if in_list:
-                out.append("</ul>")
-                in_list = False
-            out.append("<hr>")
-        else:
-            if in_list:
-                out.append("</ul>")
-                in_list = False
-            out.append(f"<p>{line}</p>")
-    if in_list:
-        out.append("</ul>")
-    joined = "\n".join(out)
-    joined = re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", joined)
-    return joined
+_MARKET_REGIME_LABELS = {
+    "TREND_UP": "восходящий тренд",
+    "TREND_DOWN": "нисходящий тренд",
+    "RANGE": "боковик",
+    "VOLATILITY_EXPANSION": "расширение волатильности",
+    "VOLATILITY_COMPRESSION": "сжатие волатильности",
+    "REVERSAL_RISK": "риск разворота",
+    "UNSTABLE": "нестабильный рынок",
+    "UNKNOWN": "неизвестно",
+}
+
+_CONFIDENCE_TOOLTIP = "Это субъективная оценка модели, а не статистически подтверждённая вероятность успеха."
+
+_CONSENSUS_STATE_LABELS = {
+    "strong": "Сильный консенсус",
+    "moderate": "Умеренный консенсус",
+    "weak": "Слабый консенсус",
+    "conflict": "Конфликт моделей",
+    "insufficient_data": "Недостаточно данных",
+}
+
+_CONSENSUS_STATE_COLOR = {
+    "strong": _STATUS["LONG"]["light"],
+    "moderate": _STATUS["WAIT"]["light"],
+    "weak": _STATUS["WAIT"]["light"],
+    "conflict": _STATUS["SHORT"]["light"],
+    "insufficient_data": "var(--text-muted)",
+}
 
 
 def _fmt(value: float | None, digits: int = 2) -> str:
@@ -107,6 +106,33 @@ def _fmt_updated_at(epoch_seconds: float | None) -> str:
     return dt.strftime("%Y-%m-%d %H:%M:%S UTC")
 
 
+def _data_freshness_dot(age_seconds: float) -> str:
+    """Green/amber/red dot next to the market header's timestamp — fresh
+    (<2 мин), starting to age (2-10 мин), or stale/lost connection feel
+    (>10 мин). Thresholds are generous relative to the scalping horizon
+    (~30 мин) so a normal refresh cadence stays green.
+    """
+    if age_seconds < 120:
+        color = _STATUS["LONG"]["light"]
+    elif age_seconds < 600:
+        color = _STATUS["WAIT"]["light"]
+    else:
+        color = _STATUS["SHORT"]["light"]
+    return f'<span class="freshness-dot" style="--status-color: {color}" aria-hidden="true"></span>'
+
+
+def _freshness_badge(freshness: Freshness | None) -> str:
+    """Age/expiry pill shown on a model card — 'Сигнал устарел' once the
+    model's own `valid_for_minutes` has elapsed (see `signal_freshness.py`).
+    A stale card is also excluded from the consensus vote (`consensus_engine.py`).
+    """
+    if freshness is None:
+        return ""
+    if freshness.is_stale:
+        return '<div class="freshness-badge freshness-badge--stale">Сигнал устарел</div>'
+    return f'<div class="freshness-badge">{html.escape(format_remaining(freshness.seconds_remaining))}</div>'
+
+
 def _stat_tile(label: str, value: str) -> str:
     return (
         '<div class="stat-tile">'
@@ -116,19 +142,24 @@ def _stat_tile(label: str, value: str) -> str:
     )
 
 
-def _verdict_line(verdict: dict[str, str | None], signal: str) -> str:
-    """One-line plain-language summary: 'Открывай на LONG, вход X, стоп Y, TP1 Z, вероятность P'.
+def _verdict_line(plan: TradePlan) -> str:
+    """One-line plain-language summary: 'Открывай на LONG, вход X, стоп Y, TP1 Z, уверенность P'.
 
-    Each "label value" pair is wrapped in its own non-breaking span so the
-    line wraps at the comma boundaries (natural text flow), never splitting
-    a label from its value or a number in the middle.
+    Values now come straight from the model's validated JSON plan — no more
+    regex-scraping numbers out of free text. Each "label value" pair is
+    wrapped in its own non-breaking span so the line wraps at the comma
+    boundaries, never splitting a label from its value or a number.
     """
-    status = _STATUS.get(signal, _STATUS["WAIT"])
-    verb = _SIGNAL_VERB.get(signal, _SIGNAL_VERB["WAIT"])
-    entry = verdict.get("entry") or "н/д"
-    stop_loss = verdict.get("stop_loss") or "н/д"
-    take_profit = verdict.get("take_profit") or "н/д"
-    probability = verdict.get("probability") or "н/д"
+    status = _STATUS.get(plan.signal, _STATUS["WAIT"])
+    verb = _SIGNAL_VERB.get(plan.signal, _SIGNAL_VERB["WAIT"])
+    entry = (
+        f"{plan.entry.from_:.2f}"
+        if plan.entry.from_ == plan.entry.to
+        else f"{plan.entry.from_:.2f}–{plan.entry.to:.2f}"
+    )
+    stop_loss = f"{plan.stop_loss:.2f}"
+    take_profit = f"{plan.take_profits[0].price:.2f}" if plan.take_profits else "н/д"
+    confidence = f"{plan.confidence}%"
 
     def pair(label: str, value: str) -> str:
         prefix = f"{html.escape(label)} " if label else ""
@@ -140,33 +171,123 @@ def _verdict_line(verdict: dict[str, str | None], signal: str) -> str:
             pair("вход", entry),
             pair("стоп", stop_loss),
             pair("TP1", take_profit),
-            pair("вероятность", probability),
+            pair("уверенность модели", confidence),
         ]
     )
+    tooltip = (
+        f'<span class="confidence-hint" tabindex="0" title="{html.escape(_CONFIDENCE_TOOLTIP)}" '
+        'aria-label="Пояснение про уверенность модели">&#9432;</span>'
+    )
     return (
-        f'<div class="verdict-line" style="--status-color: {status["light"]}; '
-        f'--status-color-dark: {status["dark"]}">'
-        f'<span class="verdict-icon" aria-hidden="true">{status["icon"]}</span> {sentence}'
+        f'<div class="verdict-line" style="--status-color: {status["light"]}">'
+        f'<span class="verdict-icon" aria-hidden="true">{status["icon"]}</span> {sentence} {tooltip}'
         "</div>"
     )
 
 
+def _list_block(title: str, items: list[str]) -> str:
+    """Always-open list — used on the consensus/trade-plan cards, which are
+    meant to be readable at a glance without an extra click.
+    """
+    if not items:
+        return ""
+    lis = "".join(f"<li>{html.escape(item)}</li>" for item in items)
+    return f'<div class="plan-block"><h4>{html.escape(title)}</h4><ul>{lis}</ul></div>'
+
+
+def _details_block(title: str, items: list[str]) -> str:
+    """Collapsed-by-default toggle — used on individual model cards so three
+    full walls of reasons/risks/invalidation text don't compete with the
+    compact always-visible summary row (product spec section 12).
+    """
+    if not items:
+        return ""
+    lis = "".join(f"<li>{html.escape(item)}</li>" for item in items)
+    return f'<details class="plan-details"><summary>{html.escape(title)}</summary><ul>{lis}</ul></details>'
+
+
+def _validator_badge(validation: ValidationResult | None) -> str:
+    if validation is None:
+        return ""
+    labels = {"valid": "Валидатор: OK", "warning": "Валидатор: предупреждение", "rejected": "Отклонено валидатором"}
+    return f'<span class="validator-badge validator-badge--{validation.status}">{labels[validation.status]}</span>'
+
+
+def _issues_html(issues: list[ValidationIssue]) -> str:
+    if not issues:
+        return ""
+    items = "".join(f"<li>{html.escape(issue.message)}</li>" for issue in issues)
+    return f'<ul class="validator-issues">{items}</ul>'
+
+
+def _raw_response_details(content: str | None) -> str:
+    if not content:
+        return ""
+    return (
+        '<details class="raw-response"><summary>Показать сырой ответ модели</summary>'
+        f"<pre>{html.escape(content)}</pre></details>"
+    )
+
+
 def _model_card(result: AIAnalysisResult, slot: int, mode: str) -> str:
-    signal = detect_signal(result.content) if result.ok else None
-    status = _STATUS.get(signal) if signal else None
+    plan = result.trade_plan
+    freshness = compute_freshness(result)
+    is_stale = freshness is not None and freshness.is_stale
+    freshness_html = _freshness_badge(freshness)
 
     if result.ok:
-        badge_html = ""
-        if status:
-            badge_html = (
-                f'<span class="signal-badge" style="--status-color: {status["light"]}; '
-                f'--status-color-dark: {status["dark"]}">'
-                f'<span class="signal-icon">{status["icon"]}</span>'
-                f'<span class="signal-text">{status["label"]}</span>'
-                "</span>"
-            )
-        verdict_html = _verdict_line(extract_verdict(result.content), signal)
-        body_html = _markdown_lite_to_html(html.escape(result.content or ""))
+        # A usable, validator-approved plan (status "valid" or "warning").
+        status = _STATUS.get(plan.signal, _STATUS["WAIT"])
+        badge_html = (
+            f'<span class="signal-badge" style="--status-color: {status["light"]}">'
+            f'<span class="signal-icon">{status["icon"]}</span>'
+            f'<span class="signal-text">{status["label"]}</span>'
+            "</span>"
+        )
+        verdict_html = _verdict_line(plan)
+        entry_status = _ENTRY_STATUS_LABELS.get(plan.entry_status, plan.entry_status)
+        market_regime = _MARKET_REGIME_LABELS.get(plan.market_regime, plan.market_regime)
+        # Collapsed-by-default toggles (spec section 12: "Причины / Риски /
+        # Условия отмены / Полный анализ" — a compact card shouldn't open
+        # with three full walls of text) — only the raw-JSON toggle stays
+        # separate below since it's the "Полный анализ" button.
+        body_html = (
+            f'<div class="entry-status">{html.escape(entry_status)} &middot; '
+            f"режим рынка: {html.escape(market_regime)}</div>"
+            + _validator_badge(result.validation)
+            + _issues_html(result.validation.issues if result.validation else [])
+            + _details_block("Причины", plan.reasons)
+            + _details_block("Риски", plan.risks)
+            + _details_block("Условия отмены", plan.invalidation_conditions)
+            + _raw_response_details(result.content)
+        )
+    elif plan is not None:
+        # Parsed fine, but trade_validator rejected the plan — never shown as
+        # a ready-to-trade signal, per the "не показывать невалидный план как
+        # полноценный сигнал" rule.
+        badge_html = (
+            '<span class="signal-badge signal-badge--error">'
+            '<span class="signal-icon">&#9940;</span><span class="signal-text">ОТКЛОНЕНО</span></span>'
+        )
+        verdict_html = ""
+        issues = result.validation.issues if result.validation else []
+        body_html = (
+            '<p class="error-text">Сценарий отклонён валидатором:</p>'
+            + _issues_html(issues)
+            + _raw_response_details(result.content)
+        )
+    elif result.error is None:
+        # Legacy AIAnalysisResult pickled before the JSON-schema migration —
+        # no trade_plan field existed yet, so it defaults to None here too.
+        badge_html = (
+            '<span class="signal-badge signal-badge--neutral">'
+            '<span class="signal-icon">&#8987;</span><span class="signal-text">СТАРЫЙ ФОРМАТ</span></span>'
+        )
+        verdict_html = ""
+        body_html = (
+            '<p class="legacy-text">Эта карточка из кеша ещё старой (текстовой) версии — '
+            "нажмите &#8635;, чтобы получить структурированный план.</p>"
+        )
     else:
         badge_html = (
             '<span class="signal-badge signal-badge--error">'
@@ -175,7 +296,7 @@ def _model_card(result: AIAnalysisResult, slot: int, mode: str) -> str:
             "</span>"
         )
         verdict_html = ""
-        body_html = f'<p class="error-text">{html.escape(result.error or "Неизвестная ошибка")}</p>'
+        body_html = f'<p class="error-text">{html.escape(result.error)}</p>' + _raw_response_details(result.content)
 
     latency = f"{result.latency_seconds:.1f} с"
     updated_str = _fmt_updated_at(getattr(result, "created_at", None))
@@ -189,14 +310,17 @@ def _model_card(result: AIAnalysisResult, slot: int, mode: str) -> str:
         "</button>"
     )
 
+    card_class = "model-card model-card--stale" if is_stale else "model-card"
+
     return f"""
-    <article class="model-card" style="--slot-index: {slot}">
+    <article class="{card_class}" style="--slot-index: {slot}">
       <header class="model-card-header">
         <span class="model-chip" aria-hidden="true"></span>
         <div class="model-header-text">
           <h3>{html.escape(result.label)}</h3>
           <div class="model-id">{html.escape(result.model)} &middot; {html.escape(latency)}</div>
           <div class="model-updated">Обновлено: {html.escape(updated_str)}</div>
+          {freshness_html}
         </div>
         {badge_html}
         {refresh_btn_html}
@@ -210,7 +334,102 @@ def _model_card(result: AIAnalysisResult, slot: int, mode: str) -> str:
     """
 
 
-_MIN_SCORED_FOR_RATING = 3
+def _consensus_card(consensus: ConsensusResult) -> str:
+    """"Итоговый вывод" — the answer to "what's happening and why" a reader
+    should get in the first couple of seconds, computed entirely in code
+    (`consensus_engine.py`) from the already-validated model plans — no
+    extra AI call.
+    """
+    status = _STATUS.get(consensus.overall_signal, _STATUS["WAIT"])
+    state_label = _CONSENSUS_STATE_LABELS.get(consensus.state, consensus.state)
+    state_color = _CONSENSUS_STATE_COLOR.get(consensus.state, "var(--text-muted)")
+    confidence_str = f"{consensus.avg_confidence:.0f}%" if consensus.avg_confidence is not None else "н/д"
+
+    return f"""
+    <section class="consensus-card" style="--status-color: {status["light"]}">
+      <div class="consensus-head">
+        <span class="consensus-signal">
+          <span class="signal-icon" aria-hidden="true">{status["icon"]}</span> {status["label"]}
+        </span>
+        <span class="consensus-state-badge" style="--state-color: {state_color}">{html.escape(state_label)}</span>
+      </div>
+      <div class="consensus-meta">
+        Консенсус: <strong>{consensus.vote_count} из {consensus.total_models}</strong> моделей
+        &middot; средняя уверенность: <strong>{html.escape(confidence_str)}</strong>
+      </div>
+      {_list_block("Причины", consensus.reasons)}
+      {_list_block("Риски", consensus.risks)}
+    </section>
+    """
+
+
+def _trade_plan_card(consensus: ConsensusResult) -> str:
+    """"Карточка торгового сценария" — entry/stop/targets synthesized (median)
+    across the models agreeing with the consensus signal, or a WAIT block
+    (spec section 14: WAIT is a full decision, not an empty result) when the
+    consensus itself is WAIT.
+    """
+    if consensus.overall_signal == "WAIT":
+        conditions_html = _list_block("Условия для входа", consensus.wait_or_invalidation)
+        empty_note = (
+            ""
+            if consensus.wait_or_invalidation
+            else '<p class="wait-summary">Явных условий для входа модели не назвали — сверьтесь с '
+            "полным анализом отдельных карточек.</p>"
+        )
+        return f"""
+        <section class="trade-plan-card trade-plan-card--wait">
+          <h2>Карточка сценария</h2>
+          <p class="wait-summary">Нет преимущества для входа прямо сейчас.</p>
+          {conditions_html}
+          {empty_note}
+        </section>
+        """
+
+    plan = consensus.plan
+    if plan is None:
+        return ""
+
+    entry = (
+        f"{plan.entry_from:.2f}" if plan.entry_from == plan.entry_to else f"{plan.entry_from:.2f}–{plan.entry_to:.2f}"
+    )
+    entry_status = _ENTRY_STATUS_LABELS.get(plan.entry_status, plan.entry_status)
+    rr_str = f"{plan.risk_reward_tp1:.2f}" if plan.risk_reward_tp1 is not None else "н/д"
+
+    figures = [
+        ("Вход", entry),
+        ("Stop loss", f"{plan.stop_loss:.2f}"),
+    ]
+    figures.extend((label, f"{price:.2f}") for label, price in plan.take_profits)
+    figures.append(("R:R до TP1", rr_str))
+    figures_html = "".join(
+        f'<div class="plan-figure"><span class="plan-figure-label">{html.escape(label)}</span>'
+        f'<span class="plan-figure-value">{html.escape(value)}</span></div>'
+        for label, value in figures
+    )
+
+    freshness_html = ""
+    if plan.formed_at is not None:
+        now = time.time()
+        expires_at = plan.formed_at + plan.valid_for_minutes * 60
+        remaining = expires_at - now
+        freshness_html = (
+            '<div class="plan-freshness">'
+            f"Сформирован {html.escape(format_age(now - plan.formed_at))} &middot; "
+            f"{html.escape(format_remaining(remaining))}"
+            "</div>"
+        )
+
+    return f"""
+    <section class="trade-plan-card">
+      <h2>Карточка сценария</h2>
+      <div class="entry-status">{html.escape(entry_status)} &middot; горизонт ~{plan.time_horizon_minutes} мин</div>
+      <div class="plan-figures">{figures_html}</div>
+      {freshness_html}
+      {_list_block("Причины входа", consensus.reasons)}
+      {_list_block("Риски", consensus.risks)}
+    </section>
+    """
 
 
 def _fmt_win_rate(win_rate: float | None) -> str:
@@ -231,13 +450,35 @@ def _slot_for_label(label: str) -> int:
         return 0
 
 
-def _win_rate_severity(win_rate: float | None, scored: int) -> dict[str, str]:
+def _fmt_r(value: float | None, digits: int = 2) -> str:
+    if value is None:
+        return "н/д"
+    sign = "+" if value > 0 else ""
+    return f"{sign}{value:.{digits}f}R"
+
+
+def _fmt_profit_factor(profit_factor: float | None, undefined: bool) -> str:
+    if undefined:
+        return "∞"  # no losing trades yet — ratio is not meaningful as a number
+    if profit_factor is None:
+        return "н/д"
+    return f"{profit_factor:.2f}"
+
+
+def _exit_reason_breakdown(counts: dict[str, int]) -> str:
+    order = ["TP1", "TP2", "TP3", "SL", "TIMEOUT", "AMBIGUOUS"]
+    parts = [f"{reason} {counts[reason]}" for reason in order if counts.get(reason)]
+    return " &middot; ".join(parts)
+
+
+def _win_rate_severity(win_rate: float | None, low_sample: bool) -> dict[str, str]:
     """Reuses the dashboard's existing LONG/WAIT/SHORT status colors as
-    good/warning/serious (green/amber/red) instead of a new palette. Fewer
-    than `_MIN_SCORED_FOR_RATING` scored predictions is treated as neutral —
-    a rate computed from 1-2 samples is noise, not a signal worth coloring.
+    good/warning/serious (green/amber/red) instead of a new palette. Below
+    `config.MIN_SAMPLE_FOR_STATS` evaluated predictions is treated as
+    neutral — a rate computed from 1-2 samples is noise, not a signal worth
+    coloring.
     """
-    if win_rate is None or scored < _MIN_SCORED_FOR_RATING:
+    if win_rate is None or low_sample:
         return {"light": "var(--text-muted)", "dark": "var(--text-muted)"}
     if win_rate >= 60:
         return _STATUS["LONG"]
@@ -247,22 +488,35 @@ def _win_rate_severity(win_rate: float | None, scored: int) -> dict[str, str]:
 
 
 def _accuracy_row(label: str, s: dict) -> str:
-    scored = s["scored"]
     win_rate = s["win_rate"]
-    severity = _win_rate_severity(win_rate, scored)
+    n = s["evaluated"]
+    severity = _win_rate_severity(win_rate, s["low_sample"])
     fill_pct = win_rate if win_rate is not None else 0
 
     if win_rate is None:
         rate_str = "н/д"
-    elif scored < _MIN_SCORED_FOR_RATING:
+    elif s["low_sample"]:
         rate_str = f"{_fmt_win_rate(win_rate)} (мало данных)"
     else:
         rate_str = _fmt_win_rate(win_rate)
 
-    detail = (
-        f"побед {s['win']} &middot; поражений {s['loss']} &middot; без изменений {s['flat']} "
-        f"&middot; ждут оценки {s['pending']} &middot; сигналов WAIT {s['skipped']}"
-    )
+    # Spec section 19: never a bare percentage — always the sample size next to it.
+    sample_note = f"{s['wins']} побед из {n}" if n else "ещё нет оценённых прогнозов"
+
+    metrics_html = ""
+    breakdown_html = ""
+    if n:
+        metrics_html = (
+            '<div class="accuracy-row-metrics">'
+            f"Expectancy: <strong>{_fmt_r(s['expectancy_r'])}</strong> &middot; "
+            f"Profit factor: <strong>{html.escape(_fmt_profit_factor(s['profit_factor'], s['profit_factor_undefined']))}</strong> &middot; "
+            f"Медиана: <strong>{_fmt_r(s['median_r'])}</strong> &middot; "
+            f"Max DD: <strong>{_fmt_r(s['max_drawdown_r'])}</strong>"
+            "</div>"
+        )
+        breakdown = _exit_reason_breakdown(s["exit_reason_counts"])
+        if breakdown:
+            breakdown_html = f'<div class="accuracy-row-breakdown">{breakdown}</div>'
 
     slot = _slot_for_label(label)
 
@@ -276,27 +530,29 @@ def _accuracy_row(label: str, s: dict) -> str:
       <div class="accuracy-meter" style="--status-color: {severity["light"]}">
         <div class="accuracy-meter-fill" style="width: {fill_pct:.0f}%"></div>
       </div>
-      <div class="accuracy-row-detail">{detail}</div>
+      <div class="accuracy-row-detail">{html.escape(sample_note)}</div>
+      {metrics_html}
+      {breakdown_html}
+      <div class="accuracy-row-waiting">ждут оценки: {s["pending"]} &middot; сигналов WAIT: {s["skipped"]}</div>
     </div>
     """
 
 
-def _accuracy_panel() -> str:
-    """Compact per-model accuracy summary built from prediction_tracker's
-    local log — answers "which model is actually right more often", not just
-    which one sounds more confident on any single card. One meter row per
-    model: bar length + color = win-rate (green ≥60%, amber 40-59%, red <40%,
-    grey = too few scored predictions to trust yet); exact counts are spelled
-    out underneath so nothing is hidden behind color alone.
+def _accuracy_panel(mode: str) -> str:
+    """Compact per-model accuracy summary for ONE trading mode, built from
+    prediction_tracker's local log — scalping and swing are never blended
+    (see the Stage 2 plan's note on why). Win-rate here means "share of
+    evaluated predictions with a positive R-multiple", where R comes from
+    walking the real BingX candle path (`outcome_simulator.py`), not just
+    comparing price at a fixed deadline.
     """
-    stats = prediction_tracker.stats_by_model()
+    stats = prediction_tracker.stats_by_model_and_mode(mode)
     if not stats:
         return (
             '<section class="accuracy-panel">'
-            "<h2>Точность прогнозов по моделям</h2>"
-            '<p class="accuracy-empty">Пока нет ни одного завершённого прогноза для оценки — '
-            "накопится по мере обновлений (после того как пройдёт горизонт оценки: "
-            "~30 мин для скальпинга, ~8 ч для свинга).</p>"
+            f"<h2>Точность прогнозов &middot; {html.escape(MODE_LABELS[mode])}</h2>"
+            '<p class="accuracy-empty">Пока нет ни одного прогноза для этого режима — '
+            "накопится по мере обновлений.</p>"
             "</section>"
         )
 
@@ -306,17 +562,17 @@ def _accuracy_panel() -> str:
 
     return f"""
     <section class="accuracy-panel">
-      <h2>Точность прогнозов по моделям</h2>
+      <h2>Точность прогнозов &middot; {html.escape(MODE_LABELS[mode])}</h2>
       <p class="accuracy-intro">
-        Как часто модель угадывает направление (LONG/SHORT) к моменту, когда проходит срок
-        прогноза (~30 мин скальпинг / ~8 ч свинг). Цвет и длина полосы = win-rate; серый —
-        оценённых прогнозов пока слишком мало, чтобы доверять проценту.
+        Реальный путь цены по свечам после прогноза — куда цена пришла раньше: TP1/TP2/TP3, стоп
+        или горизонт истёк без касания (TIMEOUT). Результат в R (единицах риска), с учётом
+        комиссии/проскальзывания. Цвет и длина полосы = доля прогнозов с положительным R.
       </p>
       {rows_html}
       <p class="accuracy-note">
-        WAIT не оценивается направленно (это не ставка на сторону вверх/вниз) — только считается
-        отдельно. Оценка не учитывает, сработал бы фактически stop loss или take profit раньше —
-        сравнивается только цена «сейчас» против цены в момент прогноза.
+        WAIT не оценивается направленно, только считается отдельно. Свеча, где одновременно задеты
+        и стоп, и цель, помечается AMBIGUOUS и консервативно засчитывается как стоп — порядок
+        внутри свечи по OHLC не восстановить.
       </p>
     </section>
     """
@@ -324,14 +580,20 @@ def _accuracy_panel() -> str:
 
 def _mode_toggle_and_grids(
     results_by_mode: dict[str, list[AIAnalysisResult]], default_mode: str
-) -> tuple[str, str]:
-    """Build the segmented-control toggle and the (hidden/shown) per-mode card grids."""
+) -> tuple[str, str, str, str]:
+    """Build the segmented-control toggle, the (hidden/shown) per-mode card
+    grids, the (hidden/shown) per-mode consensus + trade-plan summary, and
+    the (hidden/shown) per-mode accuracy panel — all four share the same
+    `data-mode` show/hide pattern driven by `setDashboardMode()`.
+    """
     modes = [m for m in ("scalping", "swing") if m in results_by_mode]
     if default_mode not in modes:
         default_mode = modes[0] if modes else "scalping"
 
     toggle_buttons = []
     grids = []
+    summaries = []
+    accuracy_panels = []
     for mode in modes:
         results = results_by_mode[mode]
         ok_count = sum(1 for r in results if r.ok)
@@ -350,8 +612,20 @@ def _mode_toggle_and_grids(
             f'style="display: {"grid" if is_active else "none"}">{cards_html}</div>'
         )
 
+        consensus = compute_consensus(results, mode, total_models=len(config.AI_MODELS))
+        summary_html = _consensus_card(consensus) + _trade_plan_card(consensus)
+        summaries.append(
+            f'<div class="mode-summary" data-mode="{html.escape(mode)}" '
+            f'style="display: {"block" if is_active else "none"}">{summary_html}</div>'
+        )
+
+        accuracy_panels.append(
+            f'<div class="mode-accuracy" data-mode="{html.escape(mode)}" '
+            f'style="display: {"block" if is_active else "none"}">{_accuracy_panel(mode)}</div>'
+        )
+
     toggle_html = f'<div class="mode-toggle" role="tablist" aria-label="Стиль анализа">{"".join(toggle_buttons)}</div>'
-    return toggle_html, "".join(grids)
+    return toggle_html, "".join(grids), "".join(summaries), "".join(accuracy_panels)
 
 
 def build_dashboard(
@@ -359,6 +633,9 @@ def build_dashboard(
 ) -> str:
     ts: datetime = snapshot["timestamp"]
     ts_str = ts.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    snapshot_age_seconds = time.time() - ts.timestamp()
+    freshness_dot = _data_freshness_dot(snapshot_age_seconds)
+    age_str = format_age(snapshot_age_seconds)
 
     stat_tiles = "".join(
         [
@@ -373,8 +650,7 @@ def build_dashboard(
         ]
     )
 
-    toggle_html, grids_html = _mode_toggle_and_grids(results_by_mode, default_mode)
-    accuracy_html = _accuracy_panel()
+    toggle_html, grids_html, summary_html, accuracy_html = _mode_toggle_and_grids(results_by_mode, default_mode)
 
     return f"""<!doctype html>
 <html lang="ru">
@@ -608,6 +884,12 @@ def build_dashboard(
     color: var(--status-color);
     font-size: 13px;
   }}
+  .confidence-hint {{
+    display: inline-block;
+    color: var(--text-muted);
+    cursor: help;
+    font-size: 12px;
+  }}
   .model-card-body {{
     padding: 14px 16px;
     font-size: 14px;
@@ -621,6 +903,181 @@ def build_dashboard(
   .model-card-body strong {{ color: var(--text-primary); }}
   .model-card-body hr {{ border: none; border-top: 1px solid var(--gridline); margin: 12px 0; }}
   .error-text {{ color: #d03b3b; }}
+  .legacy-text {{ color: var(--text-muted); }}
+  .entry-status {{
+    font-size: 12px;
+    color: var(--text-secondary);
+    margin-bottom: 10px;
+  }}
+  .validator-badge {{
+    display: inline-block;
+    padding: 3px 8px;
+    border-radius: 6px;
+    font-size: 11px;
+    font-weight: 700;
+    margin-bottom: 8px;
+  }}
+  .validator-badge--valid {{
+    color: #0ca30c;
+    background: color-mix(in srgb, #0ca30c 14%, transparent);
+  }}
+  .validator-badge--warning {{
+    color: #b5790a;
+    background: color-mix(in srgb, #fab219 20%, transparent);
+  }}
+  .validator-badge--rejected {{
+    color: #d03b3b;
+    background: color-mix(in srgb, #d03b3b 14%, transparent);
+  }}
+  .validator-issues {{
+    margin: 0 0 10px;
+    padding-left: 20px;
+    font-size: 13px;
+    color: var(--text-secondary);
+  }}
+  .plan-block {{ margin-bottom: 10px; }}
+  .plan-block h4 {{ margin: 0 0 4px; font-size: 12px; color: var(--text-muted); text-transform: uppercase; }}
+  .plan-block ul {{ margin: 0; padding-left: 18px; }}
+  .plan-details {{ margin-bottom: 6px; }}
+  .plan-details summary {{
+    cursor: pointer;
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--text-secondary);
+    padding: 2px 0;
+  }}
+  .plan-details ul {{ margin: 4px 0 0; padding-left: 18px; font-size: 13px; }}
+  .raw-response {{ margin-top: 10px; }}
+  .raw-response summary {{
+    cursor: pointer;
+    font-size: 12px;
+    color: var(--text-muted);
+  }}
+  .raw-response pre {{
+    white-space: pre-wrap;
+    word-break: break-word;
+    font-size: 12px;
+    background: var(--page-plane);
+    border: 1px solid var(--gridline);
+    border-radius: 8px;
+    padding: 10px;
+    margin-top: 6px;
+    max-height: 320px;
+    overflow-y: auto;
+  }}
+  .signal-badge--neutral {{
+    background: color-mix(in srgb, var(--text-muted) 14%, transparent);
+    border: 1px solid var(--text-muted);
+  }}
+  .signal-badge--neutral .signal-icon {{ color: var(--text-muted); }}
+  .freshness-dot {{
+    display: inline-block;
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: var(--status-color);
+    margin-right: 2px;
+  }}
+  .freshness-badge {{
+    color: var(--text-muted);
+    font-size: 11px;
+    margin-top: 2px;
+    font-variant-numeric: tabular-nums;
+  }}
+  .freshness-badge--stale {{
+    color: #d03b3b;
+    font-weight: 700;
+  }}
+  .model-card--stale {{ opacity: 0.6; }}
+  .mode-summary {{ margin-bottom: 16px; }}
+  .consensus-card {{
+    background: var(--surface-1);
+    border: 1px solid var(--border-hairline);
+    border-left: 4px solid var(--status-color);
+    border-radius: 12px;
+    padding: 16px 18px;
+    margin-bottom: 12px;
+  }}
+  .consensus-head {{
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    flex-wrap: wrap;
+    gap: 10px;
+    margin-bottom: 8px;
+  }}
+  .consensus-signal {{
+    font-size: 20px;
+    font-weight: 800;
+    color: var(--status-color);
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+  }}
+  .consensus-signal .signal-icon {{ color: var(--status-color); }}
+  .consensus-state-badge {{
+    display: inline-block;
+    padding: 4px 10px;
+    border-radius: 999px;
+    font-size: 12px;
+    font-weight: 700;
+    color: var(--state-color);
+    background: color-mix(in srgb, var(--state-color) 14%, transparent);
+    border: 1px solid var(--state-color);
+  }}
+  .consensus-meta {{
+    font-size: 13px;
+    color: var(--text-secondary);
+    margin-bottom: 4px;
+  }}
+  .consensus-meta strong {{ color: var(--text-primary); font-variant-numeric: tabular-nums; }}
+  .trade-plan-card {{
+    background: var(--surface-1);
+    border: 1px solid var(--border-hairline);
+    border-radius: 12px;
+    padding: 16px 18px;
+  }}
+  .trade-plan-card h2 {{
+    margin: 0 0 10px;
+    font-size: 15px;
+    font-weight: 700;
+  }}
+  .trade-plan-card--wait {{ border-style: dashed; }}
+  .wait-summary {{
+    margin: 0 0 10px;
+    color: var(--text-secondary);
+    font-size: 13px;
+  }}
+  .plan-figures {{
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(100px, 1fr));
+    gap: 10px;
+    margin-bottom: 10px;
+  }}
+  .plan-figure {{
+    background: var(--page-plane);
+    border: 1px solid var(--gridline);
+    border-radius: 8px;
+    padding: 8px 10px;
+  }}
+  .plan-figure-label {{
+    display: block;
+    color: var(--text-muted);
+    font-size: 11px;
+    margin-bottom: 2px;
+  }}
+  .plan-figure-value {{
+    display: block;
+    font-size: 15px;
+    font-weight: 700;
+    font-variant-numeric: tabular-nums;
+    color: var(--text-primary);
+  }}
+  .plan-freshness {{
+    font-size: 12px;
+    color: var(--text-muted);
+    margin-bottom: 10px;
+  }}
   .mode-toggle-row {{
     display: flex;
     justify-content: center;
@@ -730,6 +1187,26 @@ def build_dashboard(
     color: var(--text-muted);
     font-size: 11px;
   }}
+  .accuracy-row-metrics {{
+    margin-top: 4px;
+    color: var(--text-secondary);
+    font-size: 11px;
+  }}
+  .accuracy-row-metrics strong {{
+    color: var(--text-primary);
+    font-variant-numeric: tabular-nums;
+  }}
+  .accuracy-row-breakdown {{
+    margin-top: 4px;
+    color: var(--text-muted);
+    font-size: 11px;
+    font-variant-numeric: tabular-nums;
+  }}
+  .accuracy-row-waiting {{
+    margin-top: 4px;
+    color: var(--text-muted);
+    font-size: 11px;
+  }}
   .accuracy-empty {{
     margin: 0;
     color: var(--text-muted);
@@ -748,7 +1225,7 @@ def build_dashboard(
   <header class="page-header">
     <div>
       <h1>{html.escape(snapshot["symbol"])} &middot; {html.escape(snapshot["exchange"])}</h1>
-      <div class="subtitle">{html.escape(ts_str)}</div>
+      <div class="subtitle">{freshness_dot} {html.escape(ts_str)} &middot; данные обновлены {html.escape(age_str)}</div>
     </div>
     <div class="refresh-area">
       <span id="refresh-status" class="refresh-status"></span>
@@ -768,6 +1245,8 @@ def build_dashboard(
     {stat_tiles}
   </div>
 
+  {summary_html}
+
   {grids_html}
 
   {accuracy_html}
@@ -778,9 +1257,11 @@ def build_dashboard(
     данными, пока вы не переключитесь на неё и не обновите её отдельно. Обновление работает только если дашборд
     открыт через запущенный сервер (<code>python main.py --serve</code> или <code>python server.py</code>) —
     открытый напрямую файл может только показывать то, что было посчитано на момент генерации.
-    Сигнал и сводка (вероятность / вход / stop loss / TP1) определены автоматическим разбором текста ответа модели —
-    «н/д» означает, что модель не указала это значение в ожидаемом формате явно, сверяйтесь с полным текстом карточки.
-    Это не финансовая рекомендация.
+    Каждая модель отвечает строгим JSON-планом (сигнал, вход, стоп, цели) — числа в сводке не вытянуты
+    регуляркой из текста, это структурированные поля ответа, прошедшие программную проверку
+    (<code>trade_validator.py</code>). Отклонённый валидатором план никогда не показывается как готовый
+    сигнал к действию. «Уверенность модели» — субъективная оценка самой модели, а не статистическая
+    вероятность успеха. Это не финансовая рекомендация.
   </footer>
 </div>
 <script>
@@ -899,6 +1380,12 @@ def build_dashboard(
     }});
     document.querySelectorAll('.cards-grid').forEach(function (grid) {{
       grid.style.display = grid.dataset.mode === mode ? 'grid' : 'none';
+    }});
+    document.querySelectorAll('.mode-summary').forEach(function (summary) {{
+      summary.style.display = summary.dataset.mode === mode ? 'block' : 'none';
+    }});
+    document.querySelectorAll('.mode-accuracy').forEach(function (panel) {{
+      panel.style.display = panel.dataset.mode === mode ? 'block' : 'none';
     }});
   }}
 </script>

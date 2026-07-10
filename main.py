@@ -49,6 +49,7 @@ import prediction_tracker
 from dashboard_builder import build_dashboard
 from market_data import fetch_snapshot
 from report_builder import MODE_LABELS, build_report
+from trade_validator import build_validation_context
 
 console = Console()
 
@@ -181,15 +182,19 @@ def main() -> int:
         mode: report_text if mode == args.mode else build_report({**snapshot, "mode_key": mode})
         for mode in ("scalping", "swing")
     }
+    validation_contexts = {mode: build_validation_context(snapshot, mode) for mode in ("scalping", "swing")}
 
     try:
-        results_by_mode = ai_client.analyze_modes(report_texts, config.AI_MODELS, config.AI_REQUEST_TIMEOUT)
+        results_by_mode = ai_client.analyze_modes(
+            report_texts, config.AI_MODELS, config.AI_REQUEST_TIMEOUT, validation_contexts
+        )
     except ai_client.AIConfigError as exc:
         console.print(f"[bold red]{exc}[/bold red]")
         return 1
 
+    bingx_symbol = config.to_bingx_symbol(snapshot["symbol"])
     for mode, results in results_by_mode.items():
-        prediction_tracker.record_results(mode, results, snapshot["current_price"])
+        prediction_tracker.record_results(mode, results, snapshot["current_price"], bingx_symbol)
 
     text_sections = []
     any_ok = False

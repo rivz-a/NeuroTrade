@@ -34,6 +34,7 @@ from ai_client import AIAnalysisResult
 from dashboard_builder import build_dashboard
 from market_data import fetch_snapshot
 from report_builder import MODE_LABELS, build_report
+from trade_validator import build_validation_context
 
 # Minimum gap between two refreshes of the *same* mode. This is not about
 # rate-limiting a human clicking a button — it's a guard against exactly the
@@ -68,8 +69,10 @@ def _refresh_mode(state: _State, mode: str) -> None:
     """
     snapshot = fetch_snapshot(state.symbol, log=print)
     report_text = build_report({**snapshot, "mode_key": mode})
-    results = ai_client.analyze_with_all(report_text, config.AI_MODELS, config.AI_REQUEST_TIMEOUT, mode)
-    prediction_tracker.record_results(mode, results, snapshot["current_price"])
+    ctx = build_validation_context(snapshot, mode)
+    results = ai_client.analyze_with_all(report_text, config.AI_MODELS, config.AI_REQUEST_TIMEOUT, ctx, mode)
+    bingx_symbol = config.to_bingx_symbol(snapshot["symbol"])
+    prediction_tracker.record_results(mode, results, snapshot["current_price"], bingx_symbol)
 
     with state.lock:
         state.snapshot = snapshot
@@ -100,8 +103,10 @@ def _refresh_single(state: _State, mode: str, label: str) -> None:
 
     snapshot = fetch_snapshot(state.symbol, log=print)
     report_text = build_report({**snapshot, "mode_key": mode})
-    result = ai_client.analyze_single(report_text, cfg, config.AI_REQUEST_TIMEOUT, mode)
-    prediction_tracker.record_results(mode, [result], snapshot["current_price"])
+    ctx = build_validation_context(snapshot, mode)
+    result = ai_client.analyze_single(report_text, cfg, config.AI_REQUEST_TIMEOUT, ctx, mode)
+    bingx_symbol = config.to_bingx_symbol(snapshot["symbol"])
+    prediction_tracker.record_results(mode, [result], snapshot["current_price"], bingx_symbol)
 
     with state.lock:
         state.snapshot = snapshot
@@ -332,9 +337,15 @@ def run_server(
         report_texts = {
             mode: build_report({**snapshot, "mode_key": mode}) for mode in ("scalping", "swing")
         }
-        results_by_mode = ai_client.analyze_modes(report_texts, config.AI_MODELS, config.AI_REQUEST_TIMEOUT)
+        validation_contexts = {
+            mode: build_validation_context(snapshot, mode) for mode in ("scalping", "swing")
+        }
+        results_by_mode = ai_client.analyze_modes(
+            report_texts, config.AI_MODELS, config.AI_REQUEST_TIMEOUT, validation_contexts
+        )
+        bingx_symbol = config.to_bingx_symbol(snapshot["symbol"])
         for mode, results in results_by_mode.items():
-            prediction_tracker.record_results(mode, results, snapshot["current_price"])
+            prediction_tracker.record_results(mode, results, snapshot["current_price"], bingx_symbol)
         state.snapshot = snapshot
         state.results_by_mode = results_by_mode
         state.active_mode = initial_mode
