@@ -1,0 +1,11 @@
+venv/
+__pycache__/
+*.pyc
+.env
+market_snapshot.txt
+ai_analysis.txt
+dashboard.html
+dashboard_cache.pkl
+oi_history.jsonl
+predictions.jsonl
+*.log
