@@ -51,6 +51,66 @@ _ENTRY_STATUS_LABELS = {
     "NO_TRADE": "Нет сделки",
 }
 
+# "Открывай на LONG/SHORT" is only warranted for ENTER_NOW — every other
+# entry_status gets an "idea, not an instruction" phrasing, per the rule
+# that a directional signal is not the same thing as permission to enter.
+_ENTRY_STATUS_VERBS = {
+    ("LONG", "ENTER_NOW"): "Открывай на LONG",
+    ("SHORT", "ENTER_NOW"): "Открывай на SHORT",
+    ("LONG", "WAIT_PULLBACK"): "Идея LONG — ждать откат",
+    ("SHORT", "WAIT_PULLBACK"): "Идея SHORT — ждать откат",
+    ("LONG", "WAIT_BREAKOUT"): "Идея LONG — ждать пробой",
+    ("SHORT", "WAIT_BREAKOUT"): "Идея SHORT — ждать пробой",
+    ("LONG", "WAIT_CONFIRMATION"): "Идея LONG — ждать подтверждение",
+    ("SHORT", "WAIT_CONFIRMATION"): "Идея SHORT — ждать подтверждение",
+    ("LONG", "LATE_ENTRY"): "Поздний вход — направление LONG",
+    ("SHORT", "LATE_ENTRY"): "Поздний вход — направление SHORT",
+    ("LONG", "REJECTED"): "Направление LONG, вход запрещён",
+    ("SHORT", "REJECTED"): "Направление SHORT, вход запрещён",
+    ("LONG", "NO_TRADE"): "Направление LONG, сделки нет",
+    ("SHORT", "NO_TRADE"): "Направление SHORT, сделки нет",
+}
+
+_TRADE_PERMISSION_LABELS = {
+    "ALLOWED": "Разрешено",
+    "NOT_ALLOWED": "Не входить",
+    "EXPIRED": "Сигнал устарел",
+    "PRICE_OUTSIDE_ENTRY_ZONE": "Цена вне зоны входа",
+    "WAITING_TRIGGER": "Ждать условие входа",
+    "INVALID_PLAN": "Нет валидного плана",
+    "WAIT": "WAIT",
+}
+
+# Reuses the existing LONG/WAIT/SHORT status colors as good/caution/blocked
+# instead of a new palette — same convention as the accuracy panel's meters.
+_TRADE_PERMISSION_SEVERITY = {
+    "ALLOWED": "LONG",
+    "NOT_ALLOWED": "SHORT",
+    "EXPIRED": "SHORT",
+    "PRICE_OUTSIDE_ENTRY_ZONE": "WAIT",
+    "WAITING_TRIGGER": "WAIT",
+    "INVALID_PLAN": "SHORT",
+    "WAIT": "WAIT",
+}
+
+
+def _signal_verb(signal: str, entry_status: str) -> str:
+    if signal == "WAIT":
+        return _SIGNAL_VERB["WAIT"]
+    return _ENTRY_STATUS_VERBS.get((signal, entry_status), _SIGNAL_VERB.get(signal, _SIGNAL_VERB["WAIT"]))
+
+
+def _permission_badge(permission: str, reason: str) -> str:
+    label = _TRADE_PERMISSION_LABELS.get(permission, permission)
+    severity_key = _TRADE_PERMISSION_SEVERITY.get(permission, "WAIT")
+    color = _STATUS[severity_key]["light"]
+    return (
+        f'<div class="trade-permission-badge" style="--status-color: {color}">'
+        f'<span class="trade-permission-label">{html.escape(label)}</span>'
+        f'<span class="trade-permission-reason">{html.escape(reason)}</span>'
+        "</div>"
+    )
+
 _MARKET_REGIME_LABELS = {
     "TREND_UP": "восходящий тренд",
     "TREND_DOWN": "нисходящий тренд",
@@ -151,14 +211,22 @@ def _verdict_line(plan: TradePlan) -> str:
     boundaries, never splitting a label from its value or a number.
     """
     status = _STATUS.get(plan.signal, _STATUS["WAIT"])
-    verb = _SIGNAL_VERB.get(plan.signal, _SIGNAL_VERB["WAIT"])
-    entry = (
-        f"{plan.entry.from_:.2f}"
-        if plan.entry.from_ == plan.entry.to
-        else f"{plan.entry.from_:.2f}–{plan.entry.to:.2f}"
-    )
-    stop_loss = f"{plan.stop_loss:.2f}"
-    take_profit = f"{plan.take_profits[0].price:.2f}" if plan.take_profits else "н/д"
+    verb = _signal_verb(plan.signal, plan.entry_status)
+    if plan.signal == "WAIT":
+        # WAIT still carries entry/stop_loss/take_profits values in the
+        # schema (Pydantic requires them), but they're not a real trade —
+        # showing them as numbers would look like a fabricated plan.
+        entry = "—"
+        stop_loss = "—"
+        take_profit = "—"
+    else:
+        entry = (
+            f"{plan.entry.from_:.2f}"
+            if plan.entry.from_ == plan.entry.to
+            else f"{plan.entry.from_:.2f}–{plan.entry.to:.2f}"
+        )
+        stop_loss = f"{plan.stop_loss:.2f}"
+        take_profit = f"{plan.take_profits[0].price:.2f}" if plan.take_profits else "н/д"
     confidence = f"{plan.confidence}%"
 
     def pair(label: str, value: str) -> str:
@@ -344,6 +412,7 @@ def _consensus_card(consensus: ConsensusResult) -> str:
     state_label = _CONSENSUS_STATE_LABELS.get(consensus.state, consensus.state)
     state_color = _CONSENSUS_STATE_COLOR.get(consensus.state, "var(--text-muted)")
     confidence_str = f"{consensus.avg_confidence:.0f}%" if consensus.avg_confidence is not None else "н/д"
+    permission_html = _permission_badge(consensus.trade_permission, consensus.trade_permission_reason)
 
     return f"""
     <section class="consensus-card" style="--status-color: {status["light"]}">
@@ -354,9 +423,11 @@ def _consensus_card(consensus: ConsensusResult) -> str:
         <span class="consensus-state-badge" style="--state-color: {state_color}">{html.escape(state_label)}</span>
       </div>
       <div class="consensus-meta">
-        Консенсус: <strong>{consensus.vote_count} из {consensus.total_models}</strong> моделей
+        Согласны с направлением: <strong>{consensus.agreeing_count} из {consensus.vote_count}</strong> валидных
+        &middot; всего валидных ответов: <strong>{consensus.vote_count} из {consensus.total_models}</strong>
         &middot; средняя уверенность: <strong>{html.escape(confidence_str)}</strong>
       </div>
+      {permission_html}
       {_list_block("Причины", consensus.reasons)}
       {_list_block("Риски", consensus.risks)}
     </section>
@@ -369,6 +440,8 @@ def _trade_plan_card(consensus: ConsensusResult) -> str:
     (spec section 14: WAIT is a full decision, not an empty result) when the
     consensus itself is WAIT.
     """
+    permission_html = _permission_badge(consensus.trade_permission, consensus.trade_permission_reason)
+
     if consensus.overall_signal == "WAIT":
         conditions_html = _list_block("Условия для входа", consensus.wait_or_invalidation)
         empty_note = (
@@ -380,6 +453,7 @@ def _trade_plan_card(consensus: ConsensusResult) -> str:
         return f"""
         <section class="trade-plan-card trade-plan-card--wait">
           <h2>Карточка сценария</h2>
+          {permission_html}
           <p class="wait-summary">Нет преимущества для входа прямо сейчас.</p>
           {conditions_html}
           {empty_note}
@@ -408,6 +482,13 @@ def _trade_plan_card(consensus: ConsensusResult) -> str:
         for label, value in figures
     )
 
+    price_zone_html = ""
+    if consensus.trade_permission == "PRICE_OUTSIDE_ENTRY_ZONE":
+        price_zone_html = (
+            f'<p class="price-outside-zone-note">{html.escape(consensus.trade_permission_reason)} '
+            "Не входить по рынку — ждите возврат в зону или обновите анализ.</p>"
+        )
+
     freshness_html = ""
     if plan.formed_at is not None:
         now = time.time()
@@ -423,8 +504,11 @@ def _trade_plan_card(consensus: ConsensusResult) -> str:
     return f"""
     <section class="trade-plan-card">
       <h2>Карточка сценария</h2>
+      {permission_html}
+      <div class="plan-source">Источник плана: {html.escape(plan.source_label)}</div>
       <div class="entry-status">{html.escape(entry_status)} &middot; горизонт ~{plan.time_horizon_minutes} мин</div>
       <div class="plan-figures">{figures_html}</div>
+      {price_zone_html}
       {freshness_html}
       {_list_block("Причины входа", consensus.reasons)}
       {_list_block("Риски", consensus.risks)}
@@ -579,7 +663,7 @@ def _accuracy_panel(mode: str) -> str:
 
 
 def _mode_toggle_and_grids(
-    results_by_mode: dict[str, list[AIAnalysisResult]], default_mode: str
+    results_by_mode: dict[str, list[AIAnalysisResult]], default_mode: str, current_price: float | None = None
 ) -> tuple[str, str, str, str]:
     """Build the segmented-control toggle, the (hidden/shown) per-mode card
     grids, the (hidden/shown) per-mode consensus + trade-plan summary, and
@@ -612,7 +696,9 @@ def _mode_toggle_and_grids(
             f'style="display: {"grid" if is_active else "none"}">{cards_html}</div>'
         )
 
-        consensus = compute_consensus(results, mode, total_models=len(config.AI_MODELS))
+        consensus = compute_consensus(
+            results, mode, total_models=len(config.AI_MODELS), current_price=current_price
+        )
         summary_html = _consensus_card(consensus) + _trade_plan_card(consensus)
         summaries.append(
             f'<div class="mode-summary" data-mode="{html.escape(mode)}" '
@@ -650,7 +736,9 @@ def build_dashboard(
         ]
     )
 
-    toggle_html, grids_html, summary_html, accuracy_html = _mode_toggle_and_grids(results_by_mode, default_mode)
+    toggle_html, grids_html, summary_html, accuracy_html = _mode_toggle_and_grids(
+        results_by_mode, default_mode, snapshot.get("current_price")
+    )
 
     return f"""<!doctype html>
 <html lang="ru">
@@ -1077,6 +1165,42 @@ def build_dashboard(
     font-size: 12px;
     color: var(--text-muted);
     margin-bottom: 10px;
+  }}
+  .trade-permission-badge {{
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    gap: 8px;
+    padding: 8px 12px;
+    margin-bottom: 10px;
+    border-radius: 8px;
+    border: 1px solid var(--status-color);
+    background: color-mix(in srgb, var(--status-color) 10%, transparent);
+  }}
+  .trade-permission-label {{
+    font-size: 13px;
+    font-weight: 800;
+    color: var(--status-color);
+    text-transform: uppercase;
+    letter-spacing: 0.02em;
+  }}
+  .trade-permission-reason {{
+    font-size: 12px;
+    color: var(--text-secondary);
+  }}
+  .plan-source {{
+    font-size: 12px;
+    color: var(--text-muted);
+    margin-bottom: 8px;
+  }}
+  .price-outside-zone-note {{
+    margin: 0 0 10px;
+    padding: 8px 10px;
+    border-radius: 8px;
+    background: color-mix(in srgb, #fab219 14%, transparent);
+    border: 1px solid #fab219;
+    color: var(--text-primary);
+    font-size: 12px;
   }}
   .mode-toggle-row {{
     display: flex;
