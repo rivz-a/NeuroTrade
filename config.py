@@ -118,6 +118,12 @@ DASHBOARD_CACHE_FILE = Path(__file__).resolve().parent / "dashboard_cache.pkl"
 PROMPT_VERSION = "v2-json-schema"
 SCHEMA_VERSION = 1
 
+# User's risk-management settings (see risk_manager.py, risk_settings_store.py).
+# Local JSON file, no API keys — created with sensible defaults on first
+# read if it doesn't exist yet. Not committed (per-user local state, same
+# treatment as .env/dashboard_cache.pkl).
+RISK_SETTINGS_FILE = Path(__file__).resolve().parent / "risk_settings.json"
+
 
 @dataclass(frozen=True)
 class AIModelConfig:

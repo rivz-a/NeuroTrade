@@ -6,6 +6,7 @@ this module places orders, signs requests, or talks to any account-level API.
 
 from __future__ import annotations
 
+from decimal import Decimal
 from typing import Any
 
 import pandas as pd
@@ -205,3 +206,36 @@ def get_ticker_24h(symbol: str) -> dict[str, float] | None:
         }
     except (TypeError, ValueError):
         return None
+
+
+def get_instrument_rules(symbol: str) -> dict[str, Decimal] | None:
+    """Live exchange rounding/minimum-order rules for one symbol — the
+    `risk_manager.InstrumentRules` a position calculation should actually
+    round/check against, instead of a value hardcoded per-symbol in code.
+    Best-effort: `None` on any failure (network, symbol not found,
+    unexpected response shape) so the caller falls back to locally
+    configured rules rather than failing the whole dashboard render.
+    """
+    try:
+        data = _get("/openApi/swap/v2/quote/contracts", {})
+    except BingXError:
+        return None
+    if not isinstance(data, list):
+        return None
+    for item in data:
+        if item.get("symbol") != symbol:
+            continue
+        try:
+            quantity_precision = int(item["quantityPrecision"])
+            price_precision = int(item["pricePrecision"])
+            return {
+                "quantity_step": Decimal(1).scaleb(-quantity_precision),
+                "price_step": Decimal(1).scaleb(-price_precision),
+                "minimum_quantity": Decimal(str(item.get("tradeMinQuantity", 0))),
+                "minimum_notional_usdt": Decimal(str(item.get("tradeMinUSDT", 0))),
+                "maker_fee_percent": Decimal(str(item.get("makerFeeRate", 0))) * Decimal(100),
+                "taker_fee_percent": Decimal(str(item.get("takerFeeRate", 0))) * Decimal(100),
+            }
+        except (KeyError, TypeError, ValueError, ArithmeticError):
+            return None
+    return None

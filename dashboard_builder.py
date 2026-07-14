@@ -17,11 +17,15 @@ import time
 from datetime import datetime, timezone
 
 import config
+import position_service
 import prediction_tracker
+import risk_settings_store
 from ai_client import AIAnalysisResult
 from ai_schema import TradePlan
 from consensus_engine import ConsensusResult, compute_consensus
+from position_service import PositionServiceResult
 from report_builder import MODE_LABELS
+from risk_manager import RiskSettings
 from signal_freshness import Freshness, compute_freshness, format_age, format_remaining
 from trade_validator import ValidationIssue, ValidationResult
 
@@ -474,7 +478,7 @@ def _trade_plan_card(consensus: ConsensusResult) -> str:
         ("Вход", entry),
         ("Stop loss", f"{plan.stop_loss:.2f}"),
     ]
-    figures.extend((label, f"{price:.2f}") for label, price in plan.take_profits)
+    figures.extend((label, f"{price:.2f}") for label, price, _close_percent in plan.take_profits)
     figures.append(("R:R до TP1", rr_str))
     figures_html = "".join(
         f'<div class="plan-figure"><span class="plan-figure-label">{html.escape(label)}</span>'
@@ -513,6 +517,314 @@ def _trade_plan_card(consensus: ConsensusResult) -> str:
       {_list_block("Причины входа", consensus.reasons)}
       {_list_block("Риски", consensus.risks)}
     </section>
+    """
+
+
+_POSITION_STATUS_LABELS = {
+    "VALID": "Готово к открытию",
+    "BELOW_MINIMUM_ORDER": "Ниже минимального ордера",
+    "LOW_RISK_REWARD": "R:R ниже минимума",
+    "FEES_TOO_HIGH": "Комиссии съедают прибыль",
+    "INVALID_SETTINGS": "Некорректные настройки риска",
+    "INVALID_SCENARIO": "Некорректный сценарий",
+    "MISSING_MARKET_RULES": "Правила инструмента недоступны",
+    "RISK_LIMIT": "Ограничено риском",
+    "MARGIN_LIMIT": "Ограничено маржой",
+    "STALE_SIGNAL": "Сигнал устарел",
+    "WAITING_TRIGGER": "Ждать условие входа",
+    "PRICE_OUTSIDE_ENTRY_ZONE": "Цена вне зоны входа",
+    "STOP_ALREADY_BREACHED": "Стоп уже пробит",
+    "TP_ALREADY_REACHED": "TP1 уже достигнут",
+    "WAIT": "WAIT",
+    "INVALID_PLAN": "Нет валидного плана",
+    "NOT_ALLOWED": "Не входить",
+    "EXPIRED": "Сигнал устарел",
+}
+
+_MARGIN_MODE_LABELS_RU = {"ISOLATED": "Изолированная", "CROSS": "Кросс"}
+_ORDER_TYPE_LABELS_RU = {"MARKET": "Рыночный", "LIMIT": "Лимитный", "TRIGGER": "Триггер"}
+_ENTRY_PRICE_MODE_LABELS_RU = {
+    "MIDPOINT": "середина диапазона",
+    "CONSERVATIVE": "консервативный",
+    "BEST_CASE": "лучший случай",
+    "MANUAL": "вручную",
+}
+_BINGX_INPUT_MODE_LABELS_RU = {
+    "MARGIN_USDT": "Стоимость / маржа",
+    "NOTIONAL_USDT": "Номинал позиции",
+    "COIN_QUANTITY": "Количество монеты",
+}
+
+
+def _fmt_decimal(value, digits: int = 2) -> str:
+    if value is None:
+        return "н/д"
+    return f"{value:.{digits}f}"
+
+
+def _position_status_severity(status: str) -> str:
+    if status in ("VALID",):
+        return "LONG"
+    if status in ("WAITING_TRIGGER", "PRICE_OUTSIDE_ENTRY_ZONE", "RISK_LIMIT", "MARGIN_LIMIT", "MISSING_MARKET_RULES"):
+        return "WAIT"
+    return "SHORT"
+
+
+def _position_card(service_result: PositionServiceResult | None) -> str:
+    if service_result is None or not service_result.applicable or service_result.calculation is None:
+        return ""
+    calc = service_result.calculation
+
+    status_label = _POSITION_STATUS_LABELS.get(service_result.display_status, service_result.display_status)
+    status_color = _STATUS[_position_status_severity(service_result.display_status)]["light"]
+
+    reference_html = ""
+    if service_result.reference_only:
+        reference_html = (
+            '<div class="reference-only-note">Расчёт выполнен справочно — '
+            f"{html.escape(service_result.display_message)} Не размещать ордер до выполнения условия входа.</div>"
+        )
+
+    limited_by_str = {"RISK": "по риску", "MARGIN": "по максимальной марже", None: "н/д"}.get(calc.limited_by, "н/д")
+    entry_mode_str = _ENTRY_PRICE_MODE_LABELS_RU.get(calc.entry_price_mode.value, calc.entry_price_mode.value)
+    rules_source_str = (
+        "BingX API" if service_result.instrument_rules.source == "BINGX_API" else "локальные настройки (fallback)"
+    )
+
+    rows = [
+        ("Источник сценария", html.escape(service_result.consensus.plan.source_label)),
+        ("Баланс", f"{_fmt_decimal(calc.account_balance_usdt)} USDT"),
+        ("Риск на сделку", f"{_fmt_decimal(calc.risk_percent)}%"),
+        ("Риск-бюджет", f"{_fmt_decimal(calc.risk_budget_usdt)} USDT"),
+        ("Зона входа", f"{_fmt_decimal(calc.entry_zone[0])}–{_fmt_decimal(calc.entry_zone[1])}"),
+        ("Расчётная цена входа", _fmt_decimal(calc.entry_price)),
+        ("Метод цены входа", entry_mode_str),
+        ("Stop loss", _fmt_decimal(calc.stop_loss)),
+        ("Расстояние до стопа", f"{_fmt_decimal(calc.stop_distance)} USDT"),
+        ("Количество", _fmt_decimal(calc.position_size_coin_rounded, 4)),
+        ("Номинал позиции", f"{_fmt_decimal(calc.position_notional_usdt)} USDT"),
+        ("Требуемая маржа", f"{_fmt_decimal(calc.required_margin_usdt)} USDT"),
+        ("Плечо", f"{calc.leverage}×"),
+        ("Комиссия входа", f"{_fmt_decimal(calc.entry_fee_usdt, 4)} USDT"),
+        ("Комиссия выхода по стопу", f"{_fmt_decimal(calc.stop_exit_fee_usdt, 4)} USDT"),
+        ("Проскальзывание (оценка)", f"{_fmt_decimal(calc.slippage_estimate_usdt, 4)} USDT"),
+        ("Ожидаемый убыток при стопе", f"{_fmt_decimal(calc.total_expected_loss_usdt)} USDT"),
+        ("Фактический риск", f"{_fmt_decimal(calc.actual_risk_percent)}%"),
+        ("Свободный баланс после открытия", f"{_fmt_decimal(calc.free_balance_after_open_usdt)} USDT"),
+        ("Ограничение размера", limited_by_str),
+        ("Источник правил инструмента", rules_source_str),
+    ]
+    rows_html = "".join(
+        f'<div class="position-row"><span class="position-row-label">{html.escape(label)}</span>'
+        f'<span class="position-row-value">{value}</span></div>'
+        for label, value in rows
+    )
+
+    warnings_html = _list_block("Предупреждения", calc.warnings)
+    issues_html = _list_block("Проблемы", calc.issues) if calc.issues else ""
+    tp_table_html = _take_profit_table(service_result)
+
+    return f"""
+    <section class="position-card">
+      <h2>Расчёт позиции</h2>
+      <span class="position-status-badge" style="--status-color: {status_color}">{html.escape(status_label)}</span>
+      {reference_html}
+      <div class="position-grid">{rows_html}</div>
+      {warnings_html}
+      {issues_html}
+      {tp_table_html}
+    </section>
+    """
+
+
+def _take_profit_table(service_result: PositionServiceResult) -> str:
+    calc = service_result.calculation
+    if calc is None or not calc.take_profit_results:
+        return ""
+    rows = []
+    for tp in calc.take_profit_results:
+        net_rr_str = _fmt_decimal(tp.net_rr) if tp.net_rr is not None else "н/д"
+        primary_mark = " tp-row--primary" if tp.label == calc.primary_target_label else ""
+        rows.append(
+            f'<tr class="tp-row{primary_mark}">'
+            f"<td>{html.escape(tp.label)}</td>"
+            f"<td>{_fmt_decimal(tp.price)}</td>"
+            f"<td>{_fmt_decimal(tp.distance_percent)}%</td>"
+            f"<td>{_fmt_decimal(tp.gross_profit_usdt, 4)}</td>"
+            f"<td>{_fmt_decimal(tp.net_profit_usdt, 4)}</td>"
+            f"<td>{_fmt_decimal(tp.gross_rr)}</td>"
+            f"<td>{net_rr_str}</td>"
+            "</tr>"
+        )
+    return f"""
+    <div class="tp-table-wrap">
+      <table class="tp-table">
+        <thead>
+          <tr><th>Цель</th><th>Цена</th><th>&Delta;%</th><th>Валовая, USDT</th><th>Чистая, USDT</th>
+          <th>Gross R:R</th><th>Net R:R</th></tr>
+        </thead>
+        <tbody>{"".join(rows)}</tbody>
+      </table>
+    </div>
+    """
+
+
+def _bingx_card(service_result: PositionServiceResult | None) -> str:
+    if service_result is None or not service_result.applicable or service_result.bingx_fields is None:
+        return ""
+    fields = service_result.bingx_fields
+
+    status_label = _POSITION_STATUS_LABELS.get(service_result.display_status, service_result.display_status)
+    status_color = _STATUS[_position_status_severity(service_result.display_status)]["light"]
+
+    side_label = "Лонг" if fields.side == "LONG" else "Шорт"
+    order_type_label = _ORDER_TYPE_LABELS_RU.get(fields.order_type, fields.order_type)
+    margin_mode_label = _MARGIN_MODE_LABELS_RU.get(fields.margin_mode, fields.margin_mode)
+    input_mode_label = _BINGX_INPUT_MODE_LABELS_RU.get(fields.selected_input_mode, fields.selected_input_mode)
+    base_asset = service_result.instrument_rules.symbol.split("-")[0]
+
+    if fields.selected_input_mode == "COIN_QUANTITY":
+        selected_value_str = f"{_fmt_decimal(fields.selected_input_value, 4)} {base_asset}"
+    else:
+        selected_value_str = f"{_fmt_decimal(fields.selected_input_value)} USDT"
+
+    if service_result.can_open:
+        action_html = (
+            '<div class="bingx-action bingx-action--allowed">'
+            f"Финальное действие: нажать «Открыть {html.escape(side_label.lower())}»</div>"
+        )
+    else:
+        action_html = (
+            '<div class="bingx-action bingx-action--blocked">'
+            "Не размещать ордер до выполнения условия входа.</div>"
+        )
+
+    rows = [
+        ("Режим маржи", margin_mode_label),
+        ("Плечо", f"{fields.leverage}×"),
+        ("Направление", side_label.upper()),
+        ("Тип ордера", order_type_label),
+        ("Цена", _fmt_decimal(fields.price)),
+        ("Take profit (TP1)", _fmt_decimal(fields.take_profit) if fields.take_profit is not None else "н/д"),
+        ("Stop loss", _fmt_decimal(fields.stop_loss)),
+        ("Поле ввода в BingX", input_mode_label),
+        ("Значение поля", selected_value_str),
+    ]
+    rows_html = "".join(
+        f'<div class="bingx-field"><span class="bingx-field-label">{html.escape(label)}</span>'
+        f'<span class="bingx-field-value">{value}</span></div>'
+        for label, value in rows
+    )
+
+    extra_html = (
+        '<div class="bingx-extra">'
+        f"Маржа: {_fmt_decimal(fields.margin_usdt)} USDT &middot; "
+        f"Номинал: {_fmt_decimal(fields.notional_usdt)} USDT &middot; "
+        f"Количество: {_fmt_decimal(fields.coin_quantity, 4)} {html.escape(base_asset)}"
+        "</div>"
+    )
+
+    return f"""
+    <section class="bingx-card">
+      <h2>Что заполнить в BingX</h2>
+      <span class="position-status-badge" style="--status-color: {status_color}">{html.escape(status_label)}</span>
+      <div class="bingx-fields">{rows_html}</div>
+      {extra_html}
+      <p class="bingx-hint">Проверьте, какой режим ввода выбран в форме ордера BingX — расчёт выполнен для режима
+        «{html.escape(input_mode_label)}».</p>
+      {action_html}
+    </section>
+    """
+
+
+def _risk_settings_button() -> str:
+    return (
+        '<button type="button" class="refresh-btn risk-settings-button" onclick="openRiskSettings()">'
+        '<span aria-hidden="true">&#9881;</span> <span>Настройки риска</span></button>'
+    )
+
+
+def _risk_settings_modal(settings: RiskSettings) -> str:
+    def field(label: str, input_id: str, value, step: str | None = None, suffix: str = "") -> str:
+        step_attr = f' step="{step}"' if step else ""
+        suffix_html = f'<span class="risk-field-suffix">{html.escape(suffix)}</span>' if suffix else ""
+        return (
+            f'<label class="risk-field"><span>{html.escape(label)}</span>'
+            f'<span class="risk-field-input"><input type="number" id="{input_id}" '
+            f'value="{html.escape(str(value))}"{step_attr}>{suffix_html}</span></label>'
+        )
+
+    def select(label: str, input_id: str, options: list[tuple[str, str]], current: str) -> str:
+        opts_html = "".join(
+            f'<option value="{html.escape(v)}"{" selected" if v == current else ""}>{html.escape(l)}</option>'
+            for v, l in options
+        )
+        return f'<label class="risk-field"><span>{html.escape(label)}</span><select id="{input_id}">{opts_html}</select></label>'
+
+    available_balance = (
+        settings.available_balance_usdt if settings.available_balance_usdt is not None else settings.account_balance_usdt
+    )
+
+    fields_html = "".join(
+        [
+            field("Баланс счёта", "risk-account-balance", settings.account_balance_usdt, step="0.01", suffix="USDT"),
+            field("Доступный баланс", "risk-available-balance", available_balance, step="0.01", suffix="USDT"),
+            field("Риск на сделку", "risk-percent", settings.risk_percent, step="0.01", suffix="%"),
+            field("Максимальная маржа", "risk-max-margin", settings.max_margin_percent, step="0.01", suffix="%"),
+            field("Плечо", "risk-leverage", settings.leverage, step="1", suffix="×"),
+            select(
+                "Режим маржи",
+                "risk-margin-mode",
+                [("ISOLATED", "Изолированная"), ("CROSS", "Кросс")],
+                settings.margin_mode.value,
+            ),
+            field("Комиссия maker", "risk-maker-fee", settings.maker_fee_percent, step="0.001", suffix="%"),
+            field("Комиссия taker", "risk-taker-fee", settings.taker_fee_percent, step="0.001", suffix="%"),
+            field("Проскальзывание", "risk-slippage", settings.slippage_percent, step="0.001", suffix="%"),
+            field("Минимальный R:R", "risk-min-rr", settings.min_risk_reward, step="0.1"),
+            select(
+                "Цена входа",
+                "risk-entry-mode",
+                [
+                    ("MIDPOINT", "Середина диапазона"),
+                    ("CONSERVATIVE", "Консервативный"),
+                    ("BEST_CASE", "Лучший случай"),
+                    ("MANUAL", "Вручную"),
+                ],
+                settings.entry_price_mode.value,
+            ),
+            select(
+                "Поле ввода в BingX",
+                "risk-input-mode",
+                [
+                    ("MARGIN_USDT", "Стоимость / маржа"),
+                    ("NOTIONAL_USDT", "Номинал"),
+                    ("COIN_QUANTITY", "Количество монеты"),
+                ],
+                settings.bingx_order_input_mode.value,
+            ),
+        ]
+    )
+
+    return f"""
+    <div id="risk-settings-overlay" class="risk-settings-overlay" style="display: none"
+         data-quantity-step="{settings.quantity_step}" data-price-step="{settings.price_step}"
+         data-min-notional="{settings.minimum_order_notional_usdt}" data-min-quantity="{settings.minimum_quantity}"
+         onclick="if (event.target === this) closeRiskSettings()">
+      <div class="risk-settings-modal" role="dialog" aria-modal="true" aria-label="Настройки риска">
+        <h2>Настройки риска</h2>
+        <p class="risk-settings-note">Все расчёты (размер позиции, маржа, комиссии) выполняются кодом
+          детерминированно. AI никогда не участвует в этой математике и не вызывается при сохранении.</p>
+        <div class="risk-fields-grid">{fields_html}</div>
+        <div id="risk-settings-status" class="risk-settings-status"></div>
+        <div class="risk-settings-actions">
+          <button type="button" class="risk-btn risk-btn--primary" onclick="saveRiskSettings()">Сохранить</button>
+          <button type="button" class="risk-btn" onclick="recalculateActiveScenario()">Пересчитать</button>
+          <button type="button" class="risk-btn" onclick="resetRiskSettingsForm()">Сбросить</button>
+          <button type="button" class="risk-btn" onclick="closeRiskSettings()">Отмена</button>
+        </div>
+      </div>
+    </div>
     """
 
 
@@ -663,16 +975,27 @@ def _accuracy_panel(mode: str) -> str:
 
 
 def _mode_toggle_and_grids(
-    results_by_mode: dict[str, list[AIAnalysisResult]], default_mode: str, current_price: float | None = None
+    results_by_mode: dict[str, list[AIAnalysisResult]],
+    default_mode: str,
+    symbol: str,
+    settings: RiskSettings,
+    current_price: float | None = None,
 ) -> tuple[str, str, str, str]:
     """Build the segmented-control toggle, the (hidden/shown) per-mode card
-    grids, the (hidden/shown) per-mode consensus + trade-plan summary, and
-    the (hidden/shown) per-mode accuracy panel — all four share the same
-    `data-mode` show/hide pattern driven by `setDashboardMode()`.
+    grids, the (hidden/shown) per-mode consensus + trade-plan + position/
+    BingX summary, and the (hidden/shown) per-mode accuracy panel — all four
+    share the same `data-mode` show/hide pattern driven by `setDashboardMode()`.
     """
     modes = [m for m in ("scalping", "swing") if m in results_by_mode]
     if default_mode not in modes:
         default_mode = modes[0] if modes else "scalping"
+
+    instrument_rules = None
+    if current_price is not None:
+        try:
+            instrument_rules = position_service.resolve_instrument_rules(config.to_bingx_symbol(symbol), settings)
+        except Exception:
+            instrument_rules = None
 
     toggle_buttons = []
     grids = []
@@ -696,10 +1019,28 @@ def _mode_toggle_and_grids(
             f'style="display: {"grid" if is_active else "none"}">{cards_html}</div>'
         )
 
-        consensus = compute_consensus(
-            results, mode, total_models=len(config.AI_MODELS), current_price=current_price
+        service_result = None
+        if instrument_rules is not None and current_price is not None:
+            service_result = position_service.calculate_active_position(
+                results,
+                mode,
+                total_models=len(config.AI_MODELS),
+                current_price=current_price,
+                settings=settings,
+                instrument_rules=instrument_rules,
+            )
+            consensus = service_result.consensus
+        else:
+            consensus = compute_consensus(
+                results, mode, total_models=len(config.AI_MODELS), current_price=current_price
+            )
+
+        summary_html = (
+            _consensus_card(consensus)
+            + _trade_plan_card(consensus)
+            + _position_card(service_result)
+            + _bingx_card(service_result)
         )
-        summary_html = _consensus_card(consensus) + _trade_plan_card(consensus)
         summaries.append(
             f'<div class="mode-summary" data-mode="{html.escape(mode)}" '
             f'style="display: {"block" if is_active else "none"}">{summary_html}</div>'
@@ -736,9 +1077,11 @@ def build_dashboard(
         ]
     )
 
+    risk_settings = risk_settings_store.load()
     toggle_html, grids_html, summary_html, accuracy_html = _mode_toggle_and_grids(
-        results_by_mode, default_mode, snapshot.get("current_price")
+        results_by_mode, default_mode, snapshot["symbol"], risk_settings, snapshot.get("current_price")
     )
+    risk_settings_modal_html = _risk_settings_modal(risk_settings)
 
     return f"""<!doctype html>
 <html lang="ru">
@@ -1342,6 +1685,226 @@ def build_dashboard(
     font-size: 11px;
     line-height: 1.5;
   }}
+  .risk-settings-overlay {{
+    position: fixed;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.5);
+    display: flex;
+    align-items: flex-start;
+    justify-content: center;
+    padding: 40px 16px;
+    overflow-y: auto;
+    z-index: 100;
+  }}
+  .risk-settings-modal {{
+    background: var(--surface-1);
+    border-radius: 14px;
+    border: 1px solid var(--border-hairline);
+    padding: 20px 22px;
+    width: 100%;
+    max-width: 640px;
+  }}
+  .risk-settings-modal h2 {{
+    margin: 0 0 8px;
+    font-size: 16px;
+    font-weight: 700;
+  }}
+  .risk-settings-note {{
+    margin: 0 0 14px;
+    color: var(--text-muted);
+    font-size: 12px;
+    line-height: 1.5;
+  }}
+  .risk-fields-grid {{
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+    gap: 12px;
+    margin-bottom: 14px;
+  }}
+  .risk-field {{
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    font-size: 12px;
+    color: var(--text-secondary);
+  }}
+  .risk-field input,
+  .risk-field select {{
+    font: inherit;
+    font-size: 13px;
+    padding: 7px 9px;
+    border-radius: 7px;
+    border: 1px solid var(--border-hairline);
+    background: var(--page-plane);
+    color: var(--text-primary);
+  }}
+  .risk-field-input {{
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }}
+  .risk-field-input input {{ flex: 1; min-width: 0; }}
+  .risk-field-suffix {{
+    color: var(--text-muted);
+    font-size: 12px;
+    white-space: nowrap;
+  }}
+  .risk-settings-status {{
+    min-height: 16px;
+    margin-bottom: 10px;
+    font-size: 12px;
+    color: var(--text-muted);
+  }}
+  .risk-settings-status.error {{ color: #d03b3b; }}
+  .risk-settings-actions {{
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+  }}
+  .risk-btn {{
+    padding: 8px 14px;
+    border-radius: 8px;
+    border: 1px solid var(--border-hairline);
+    background: var(--page-plane);
+    color: var(--text-primary);
+    font: inherit;
+    font-size: 13px;
+    font-weight: 600;
+    cursor: pointer;
+  }}
+  .risk-btn--primary {{
+    background: var(--text-primary);
+    color: var(--surface-1);
+    border-color: var(--text-primary);
+  }}
+  .position-card, .bingx-card {{
+    background: var(--surface-1);
+    border: 1px solid var(--border-hairline);
+    border-radius: 12px;
+    padding: 16px 18px;
+    margin-bottom: 12px;
+  }}
+  .position-card h2, .bingx-card h2 {{
+    margin: 0 0 10px;
+    font-size: 15px;
+    font-weight: 700;
+    display: inline-block;
+    margin-right: 10px;
+  }}
+  .position-status-badge {{
+    display: inline-block;
+    padding: 3px 10px;
+    border-radius: 999px;
+    font-size: 11px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.02em;
+    color: var(--status-color);
+    background: color-mix(in srgb, var(--status-color) 14%, transparent);
+    border: 1px solid var(--status-color);
+    vertical-align: middle;
+  }}
+  .reference-only-note {{
+    margin: 10px 0;
+    padding: 8px 10px;
+    border-radius: 8px;
+    background: color-mix(in srgb, #fab219 14%, transparent);
+    border: 1px solid #fab219;
+    color: var(--text-primary);
+    font-size: 12px;
+  }}
+  .position-grid {{
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+    gap: 8px 14px;
+    margin: 12px 0;
+  }}
+  .position-row {{
+    display: flex;
+    justify-content: space-between;
+    gap: 10px;
+    padding: 6px 0;
+    border-bottom: 1px solid var(--gridline);
+    font-size: 12px;
+  }}
+  .position-row-label {{ color: var(--text-muted); }}
+  .position-row-value {{
+    color: var(--text-primary);
+    font-weight: 600;
+    font-variant-numeric: tabular-nums;
+    text-align: right;
+  }}
+  .tp-table-wrap {{
+    overflow-x: auto;
+    margin-top: 10px;
+  }}
+  .tp-table {{
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 12px;
+    font-variant-numeric: tabular-nums;
+  }}
+  .tp-table th, .tp-table td {{
+    padding: 7px 9px;
+    text-align: right;
+    border-bottom: 1px solid var(--gridline);
+    white-space: nowrap;
+  }}
+  .tp-table th:first-child, .tp-table td:first-child {{ text-align: left; }}
+  .tp-table th {{
+    color: var(--text-muted);
+    font-weight: 600;
+  }}
+  .tp-row--primary td {{ color: var(--text-primary); font-weight: 700; }}
+  .bingx-fields {{
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+    gap: 8px 14px;
+    margin: 12px 0;
+  }}
+  .bingx-field {{
+    display: flex;
+    justify-content: space-between;
+    gap: 10px;
+    padding: 6px 0;
+    border-bottom: 1px solid var(--gridline);
+    font-size: 12px;
+  }}
+  .bingx-field-label {{ color: var(--text-muted); }}
+  .bingx-field-value {{
+    color: var(--text-primary);
+    font-weight: 700;
+    font-variant-numeric: tabular-nums;
+    text-align: right;
+  }}
+  .bingx-extra {{
+    margin: 8px 0;
+    color: var(--text-secondary);
+    font-size: 12px;
+  }}
+  .bingx-hint {{
+    margin: 8px 0;
+    color: var(--text-muted);
+    font-size: 11px;
+    line-height: 1.5;
+  }}
+  .bingx-action {{
+    margin-top: 10px;
+    padding: 9px 12px;
+    border-radius: 8px;
+    font-size: 13px;
+    font-weight: 700;
+  }}
+  .bingx-action--allowed {{
+    background: color-mix(in srgb, {_STATUS["LONG"]["light"]} 16%, transparent);
+    border: 1px solid {_STATUS["LONG"]["light"]};
+    color: var(--text-primary);
+  }}
+  .bingx-action--blocked {{
+    background: color-mix(in srgb, {_STATUS["SHORT"]["light"]} 12%, transparent);
+    border: 1px solid {_STATUS["SHORT"]["light"]};
+    color: var(--text-primary);
+  }}
 </style>
 </head>
 <body>
@@ -1353,6 +1916,7 @@ def build_dashboard(
     </div>
     <div class="refresh-area">
       <span id="refresh-status" class="refresh-status"></span>
+      {_risk_settings_button()}
       <button id="refresh-btn" class="refresh-btn" type="button" onclick="refreshDashboard(this)"
               title="Заново запрашивает данные BingX и AI для активной вкладки (нужен запущенный python main.py --serve / python server.py).">
         <span class="refresh-icon" aria-hidden="true">&#8635;</span>
@@ -1360,6 +1924,8 @@ def build_dashboard(
       </button>
     </div>
   </header>
+
+  {risk_settings_modal_html}
 
   <div class="mode-toggle-row">
     {toggle_html}
@@ -1511,6 +2077,124 @@ def build_dashboard(
     document.querySelectorAll('.mode-accuracy').forEach(function (panel) {{
       panel.style.display = panel.dataset.mode === mode ? 'block' : 'none';
     }});
+  }}
+
+  var riskSettingsBusy = false;
+
+  function openRiskSettings() {{
+    document.getElementById('risk-settings-overlay').style.display = 'flex';
+  }}
+
+  function closeRiskSettings() {{
+    document.getElementById('risk-settings-overlay').style.display = 'none';
+  }}
+
+  function resetRiskSettingsForm() {{
+    if (riskSettingsBusy) return;
+    location.reload();
+  }}
+
+  function collectRiskSettingsForm() {{
+    var overlay = document.getElementById('risk-settings-overlay');
+    return {{
+      account_balance_usdt: document.getElementById('risk-account-balance').value,
+      available_balance_usdt: document.getElementById('risk-available-balance').value,
+      risk_percent: document.getElementById('risk-percent').value,
+      leverage: parseInt(document.getElementById('risk-leverage').value, 10),
+      margin_mode: document.getElementById('risk-margin-mode').value,
+      max_margin_percent: document.getElementById('risk-max-margin').value,
+      maker_fee_percent: document.getElementById('risk-maker-fee').value,
+      taker_fee_percent: document.getElementById('risk-taker-fee').value,
+      slippage_percent: document.getElementById('risk-slippage').value,
+      min_risk_reward: document.getElementById('risk-min-rr').value,
+      entry_price_mode: document.getElementById('risk-entry-mode').value,
+      bingx_order_input_mode: document.getElementById('risk-input-mode').value,
+      quantity_step: overlay.dataset.quantityStep,
+      price_step: overlay.dataset.priceStep,
+      minimum_order_notional_usdt: overlay.dataset.minNotional,
+      minimum_quantity: overlay.dataset.minQuantity
+    }};
+  }}
+
+  function saveRiskSettings() {{
+    if (riskSettingsBusy) return;
+    riskSettingsBusy = true;
+    var status = document.getElementById('risk-settings-status');
+    status.textContent = 'Сохраняю...';
+    status.classList.remove('error');
+    var buttons = document.querySelectorAll('.risk-settings-actions .risk-btn');
+    buttons.forEach(function (b) {{ b.disabled = true; }});
+
+    fetch('/api/risk-settings', {{
+      method: 'PUT',
+      headers: {{ 'Content-Type': 'application/json' }},
+      body: JSON.stringify(collectRiskSettingsForm()),
+      cache: 'no-store'
+    }})
+      .then(function (resp) {{
+        return resp.json().catch(function () {{ return {{}}; }}).then(function (data) {{
+          return {{ ok: resp.ok, data: data }};
+        }});
+      }})
+      .then(function (result) {{
+        if (result.ok && result.data && result.data.ok) {{
+          location.reload();
+          return;
+        }}
+        var errors = (result.data && result.data.errors) ? result.data.errors.join(' ')
+          : ((result.data && result.data.error) || 'Не удалось сохранить настройки.');
+        status.textContent = errors;
+        status.classList.add('error');
+      }})
+      .catch(function () {{
+        status.textContent = 'Сервер не отвечает.';
+        status.classList.add('error');
+      }})
+      .finally(function () {{
+        riskSettingsBusy = false;
+        buttons.forEach(function (b) {{ b.disabled = false; }});
+      }});
+  }}
+
+  function recalculateActiveScenario() {{
+    if (riskSettingsBusy) return;
+    riskSettingsBusy = true;
+    var status = document.getElementById('risk-settings-status');
+    status.textContent = 'Пересчитываю...';
+    status.classList.remove('error');
+    var buttons = document.querySelectorAll('.risk-settings-actions .risk-btn');
+    buttons.forEach(function (b) {{ b.disabled = true; }});
+
+    var activeToggle = document.querySelector('.mode-toggle-btn.active');
+    var mode = activeToggle ? activeToggle.dataset.mode : 'scalping';
+
+    fetch('/api/recalculate-active-scenario', {{
+      method: 'POST',
+      headers: {{ 'Content-Type': 'application/json' }},
+      body: JSON.stringify({{ mode: mode }}),
+      cache: 'no-store'
+    }})
+      .then(function (resp) {{
+        return resp.json().catch(function () {{ return {{}}; }}).then(function (data) {{
+          return {{ ok: resp.ok, data: data }};
+        }});
+      }})
+      .then(function (result) {{
+        if (result.ok && result.data && result.data.ok) {{
+          location.reload();
+          return;
+        }}
+        status.textContent = (result.data && result.data.error) || 'Не удалось пересчитать.';
+        status.classList.add('error');
+      }})
+      .catch(function () {{
+        status.textContent = 'Сервер не отвечает.';
+        status.classList.add('error');
+      }})
+      .finally(function () {{
+        riskSettingsBusy = false;
+        buttons.forEach(function (b) {{ b.disabled = false; }});
+      }});
   }}
 </script>
 </body>

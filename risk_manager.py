@@ -201,34 +201,43 @@ class RiskValidationResult:
     issues: list[str]
 
 
+def validate_settings(settings: RiskSettings) -> list[str]:
+    """Settings-only checks — split out so callers that don't have a
+    `TradeScenario` yet (the `PUT /api/risk-settings` handler, validating a
+    user's edited form before any trade idea exists) can reuse the exact
+    same rules `validate_scenario_and_settings` runs internally.
+    """
+    issues: list[str] = []
+    if settings.account_balance_usdt <= 0:
+        issues.append("Баланс счёта должен быть положительным.")
+    if settings.leverage < 1:
+        issues.append("Плечо должно быть не меньше 1.")
+    if not (Decimal("0") <= settings.risk_percent <= Decimal("100")):
+        issues.append("Риск на сделку должен быть в диапазоне 0-100%.")
+    if not (Decimal("0") < settings.max_margin_percent <= Decimal("100")):
+        issues.append("Максимальная доля маржи должна быть в диапазоне (0, 100]%.")
+    if settings.maker_fee_percent < 0 or settings.taker_fee_percent < 0:
+        issues.append("Комиссии не могут быть отрицательными.")
+    if settings.slippage_percent < 0:
+        issues.append("Проскальзывание не может быть отрицательным.")
+    if settings.quantity_step <= 0:
+        issues.append("Шаг количества должен быть положительным.")
+    if settings.price_step <= 0:
+        issues.append("Шаг цены должен быть положительным.")
+    if settings.minimum_order_notional_usdt < 0:
+        issues.append("Минимальный номинал ордера не может быть отрицательным.")
+    if settings.min_risk_reward <= 0:
+        issues.append("Минимальный Risk/Reward должен быть положительным.")
+    return issues
+
+
 def validate_scenario_and_settings(scenario: TradeScenario, settings: RiskSettings) -> RiskValidationResult:
     """Sanity-checks the calculator's OWN inputs (not the AI's raw text —
     that's `trade_validator.py`'s job, on `ai_schema.TradePlan`, before a
     `TradeScenario` is even built). Runs strictly before any arithmetic so a
     NaN/negative/inverted input can never silently produce a bogus position.
     """
-    settings_issues: list[str] = []
-    if settings.account_balance_usdt <= 0:
-        settings_issues.append("Баланс счёта должен быть положительным.")
-    if settings.leverage < 1:
-        settings_issues.append("Плечо должно быть не меньше 1.")
-    if not (Decimal("0") <= settings.risk_percent <= Decimal("100")):
-        settings_issues.append("Риск на сделку должен быть в диапазоне 0-100%.")
-    if not (Decimal("0") < settings.max_margin_percent <= Decimal("100")):
-        settings_issues.append("Максимальная доля маржи должна быть в диапазоне (0, 100]%.")
-    if settings.maker_fee_percent < 0 or settings.taker_fee_percent < 0:
-        settings_issues.append("Комиссии не могут быть отрицательными.")
-    if settings.slippage_percent < 0:
-        settings_issues.append("Проскальзывание не может быть отрицательным.")
-    if settings.quantity_step <= 0:
-        settings_issues.append("Шаг количества должен быть положительным.")
-    if settings.price_step <= 0:
-        settings_issues.append("Шаг цены должен быть положительным.")
-    if settings.minimum_order_notional_usdt < 0:
-        settings_issues.append("Минимальный номинал ордера не может быть отрицательным.")
-    if settings.min_risk_reward <= 0:
-        settings_issues.append("Минимальный Risk/Reward должен быть положительным.")
-
+    settings_issues = validate_settings(settings)
     if settings_issues:
         return RiskValidationResult(ok=False, status=PositionStatus.INVALID_SETTINGS, issues=settings_issues)
 
@@ -610,4 +619,99 @@ class PositionCalculator:
             bingx_fields=bingx_fields,
             warnings=warnings,
             issues=issues,
+        )
+
+
+@dataclass(frozen=True)
+class InstrumentRules:
+    """Exchange-side rounding/minimum-order rules for one symbol — either
+    fetched live from BingX (`source="BINGX_API"`) or a fallback built from
+    the user's own `RiskSettings` when the live fetch isn't available
+    (`source="FALLBACK"`). Never hardcoded per-symbol in code; see
+    `bingx_client.get_instrument_rules`.
+    """
+
+    symbol: str
+    price_step: Decimal
+    quantity_step: Decimal
+    minimum_quantity: Decimal
+    minimum_notional_usdt: Decimal
+    maximum_leverage: int
+    source: Literal["BINGX_API", "FALLBACK"]
+
+
+# Direct matches for the common cases; a substring heuristic below covers
+# whatever a model invents beyond this table (e.g. "Limit Short" fails the
+# exact match but the "market"/"trigger" substring checks still classify it).
+_ENTRY_TYPE_TABLE = {
+    "market": "MARKET",
+    "limit": "LIMIT",
+    "trigger": "TRIGGER",
+    "none": "LIMIT",
+}
+
+
+def normalize_entry_order_type(raw: str) -> Literal["MARKET", "LIMIT", "TRIGGER"]:
+    """Maps whatever string the AI put in `entry.type` (`"Limit Short"`,
+    `"limit"`, `"pullback_to_ema"`, `"breakout"`, an empty string for WAIT,
+    ...) onto BingX's three real order types. `entry.type` is deliberately
+    left as a free `str` in `ai_schema.EntryZone` (no prompt/schema change
+    needed for this) — all the normalizing happens here, at the one place
+    that turns a plan into BingX-fillable fields.
+    """
+    normalized = (raw or "").strip().lower()
+    if normalized in _ENTRY_TYPE_TABLE:
+        return _ENTRY_TYPE_TABLE[normalized]
+    if "market" in normalized:
+        return "MARKET"
+    if "trigger" in normalized or "breakout" in normalized:
+        return "TRIGGER"
+    # Anything else (a pullback/confirmation condition, an unrecognized
+    # word, blank) defaults to LIMIT — reviewable and never an immediate
+    # fill, the conservative choice among the three.
+    return "LIMIT"
+
+
+@dataclass(frozen=True)
+class BingXManualFields:
+    """The exact values a user would type into BingX's manual order form —
+    presentation-agnostic (raw enum values, not Russian labels; that
+    translation lives in `dashboard_builder.py` alongside every other
+    label dict, not mixed into this financial-math module).
+    """
+
+    margin_mode: str  # "ISOLATED" | "CROSS"
+    leverage: int
+    side: str  # "LONG" | "SHORT"
+    order_type: str  # "MARKET" | "LIMIT" | "TRIGGER"
+    price: Decimal
+    take_profit: Decimal | None
+    stop_loss: Decimal
+    selected_input_mode: str  # "MARGIN_USDT" | "NOTIONAL_USDT" | "COIN_QUANTITY"
+    selected_input_value: Decimal
+    margin_usdt: Decimal
+    notional_usdt: Decimal
+    coin_quantity: Decimal
+
+
+def build_bingx_manual_fields(
+    calculation: PositionCalculation,
+    order_type: Literal["MARKET", "LIMIT", "TRIGGER"],
+    settings: RiskSettings,
+) -> BingXManualFields:
+    take_profit = calculation.take_profit_results[0].price if calculation.take_profit_results else None
+    selected_mode = settings.bingx_order_input_mode.value
+    return BingXManualFields(
+        margin_mode=settings.margin_mode.value,
+        leverage=settings.leverage,
+        side=calculation.signal,
+        order_type=order_type,
+        price=calculation.entry_price,
+        take_profit=take_profit,
+        stop_loss=calculation.stop_loss,
+        selected_input_mode=selected_mode,
+        selected_input_value=calculation.bingx_fields.get(selected_mode, calculation.required_margin_usdt),
+        margin_usdt=calculation.bingx_fields.get("MARGIN_USDT", calculation.required_margin_usdt),
+        notional_usdt=calculation.bingx_fields.get("NOTIONAL_USDT", calculation.position_notional_usdt),
+        coin_quantity=calculation.bingx_fields.get("COIN_QUANTITY", calculation.position_size_coin_rounded),
         )

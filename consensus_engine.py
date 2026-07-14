@@ -88,10 +88,11 @@ _ENTRY_STATUS_WAIT_REASONS = {
 class SelectedPlan:
     source_label: str
     entry_status: str
+    entry_type: str  # raw AI-supplied value (e.g. "Limit", "pullback_to_ema") — normalize before use
     entry_from: float
     entry_to: float
     stop_loss: float
-    take_profits: list[tuple[str, float]]
+    take_profits: list[tuple[str, float, float]]  # (label, price, close_percent)
     risk_reward_tp1: float | None
     time_horizon_minutes: int
     valid_for_minutes: int
@@ -187,10 +188,11 @@ def _select_best_plan(agreeing: list[AIAnalysisResult]) -> SelectedPlan | None:
     return SelectedPlan(
         source_label=best_result.label,
         entry_status=plan.entry_status,
+        entry_type=plan.entry.type,
         entry_from=plan.entry.from_,
         entry_to=plan.entry.to,
         stop_loss=plan.stop_loss,
-        take_profits=[(tp.label, tp.price) for tp in plan.take_profits],
+        take_profits=[(tp.label, tp.price, tp.close_percent) for tp in plan.take_profits],
         risk_reward_tp1=_gross_rr_to_tp1(plan),
         time_horizon_minutes=plan.time_horizon_minutes,
         valid_for_minutes=plan.valid_for_minutes,

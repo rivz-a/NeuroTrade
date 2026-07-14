@@ -8,4 +8,5 @@ dashboard.html
 dashboard_cache.pkl
 oi_history.jsonl
 predictions.jsonl
+risk_settings.json
 *.log
