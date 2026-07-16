@@ -1014,21 +1014,26 @@ def update_position_add_fill(
     # computed liquidation price/margin (anchored to the FIRST fill) would
     # now be stale — recompute against the new weighted-average entry and
     # new total quantity, same as at initial open. Skipped (stays NULL) if
-    # leverage isn't set.
+    # leverage isn't set, or if the new leverage/mmr combination is outside
+    # what compute_liquidation_price can represent (see its docstring) —
+    # best-effort, never blocks the fill itself.
     liquidation_price = None
     maintenance_margin_usdt = None
     initial_margin_usdt = None
     if row["leverage"]:
         mmr = Decimal(str(config.PAPER_TRADING_MAINTENANCE_MARGIN_RATE))
         new_notional = new_price * new_qty
-        liquidation_price = compute_liquidation_price(new_price, row["leverage"], row["side"], mmr)
-        maintenance_margin_usdt = compute_maintenance_margin_usdt(new_notional, mmr)
-        initial_margin_usdt = new_notional / row["leverage"]
+        try:
+            liquidation_price = compute_liquidation_price(new_price, row["leverage"], row["side"], mmr)
+            maintenance_margin_usdt = compute_maintenance_margin_usdt(new_notional, mmr)
+            initial_margin_usdt = new_notional / row["leverage"]
+        except ValueError:
+            pass
 
     conn.execute(
         """
         UPDATE positions SET entry_price = ?, quantity = ?, liquidation_price = ?,
-            maintenance_margin_usdt = ?, initial_margin_usdt = COALESCE(?, initial_margin_usdt)
+            maintenance_margin_usdt = ?, initial_margin_usdt = ?
         WHERE id = ?
         """,
         (
@@ -1057,21 +1062,36 @@ def insert_fill(
     real_order_id: int | None = None,
     label: str | None = None,
     now: float | None = None,
+    intrabar_ambiguous: bool = False,
+    resolution_policy: str | None = None,
 ) -> int:
     """`label` is the take-profit label ('TP1'/'TP2'/'TP3') when
     `fill_type='TAKE_PROFIT'` — the only way to know which specific target
     closed, since `fill_type` itself is generic. NULL for every other
     fill_type.
+
+    `intrabar_ambiguous`/`resolution_policy` matter only for
+    `fill_type='LIQUIDATION'`: paper_trading.py's tick model is a single
+    bid/ask POINT, not an OHLC range, so true same-candle ambiguity (as
+    outcome_simulator.py has to handle) can't occur between TP and SL/
+    liquidation (they sit on opposite sides of entry). It CAN occur between
+    liquidation and stop_loss, if a single tick's price move is large
+    enough to cross both in one step (a gap/slippage-sized move, not
+    typical minute-by-tick data) — liquidation always wins
+    (`resolution_policy='LIQUIDATION_FIRST'`), and `intrabar_ambiguous=True`
+    flags that the stop_loss was ALSO crossed in that same tick, so
+    downstream statistics don't read this as a cleaner signal than the
+    data actually supports.
     """
     now = now if now is not None else time.time()
     cur = conn.execute(
         """
         INSERT INTO fills (
             position_id, paper_order_id, real_order_id, symbol, side, fill_type, label, price, quantity,
-            fee_usdt, realized_pnl_usdt, filled_at
+            fee_usdt, realized_pnl_usdt, intrabar_ambiguous, resolution_policy, filled_at
         ) VALUES (
             :position_id, :paper_order_id, :real_order_id, :symbol, :side, :fill_type, :label, :price, :quantity,
-            :fee_usdt, :realized_pnl_usdt, :filled_at
+            :fee_usdt, :realized_pnl_usdt, :intrabar_ambiguous, :resolution_policy, :filled_at
         )
         """,
         {
@@ -1086,6 +1106,8 @@ def insert_fill(
             "quantity": _norm_dec_text(quantity),
             "fee_usdt": _norm_dec_text(fee_usdt),
             "realized_pnl_usdt": _norm_dec_text(realized_pnl_usdt),
+            "intrabar_ambiguous": int(intrabar_ambiguous),
+            "resolution_policy": resolution_policy,
             "filled_at": now,
         },
     )
@@ -1555,7 +1577,7 @@ def get_position_fills(conn: sqlite3.Connection, position_id: int) -> list[dict]
     rows = conn.execute(
         "SELECT * FROM fills WHERE position_id = ? ORDER BY filled_at, id", (position_id,)
     ).fetchall()
-    return [_row_to_dict(r, decimal_fields=_FILL_DECIMAL_FIELDS) for r in rows]
+    return [_row_to_dict(r, decimal_fields=_FILL_DECIMAL_FIELDS, bool_fields=("intrabar_ambiguous",)) for r in rows]
 
 
 # ---------------------------------------------------------------------------

@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import sqlite3
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 _MARKET_SNAPSHOTS = """
 CREATE TABLE IF NOT EXISTS market_snapshots (
@@ -343,6 +343,8 @@ CREATE TABLE IF NOT EXISTS fills (
     quantity            TEXT NOT NULL,
     fee_usdt            TEXT,
     realized_pnl_usdt   TEXT,
+    intrabar_ambiguous  INTEGER NOT NULL DEFAULT 0,
+    resolution_policy   TEXT,
     filled_at           REAL NOT NULL
 )
 """

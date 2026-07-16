@@ -363,9 +363,16 @@ def _get_or_grow_position_for_order(conn, order: dict, *, side: str, fill_price:
     if leverage:
         mmr = Decimal(str(config.PAPER_TRADING_MAINTENANCE_MARGIN_RATE))
         notional = fill_price * fill_qty
-        initial_margin_usdt = notional / leverage
-        maintenance_margin_usdt = compute_maintenance_margin_usdt(notional, mmr)
-        liquidation_price = compute_liquidation_price(fill_price, leverage, side, mmr)
+        try:
+            liquidation_price = compute_liquidation_price(fill_price, leverage, side, mmr)
+            initial_margin_usdt = notional / leverage
+            maintenance_margin_usdt = compute_maintenance_margin_usdt(notional, mmr)
+        except ValueError:
+            # leverage too extreme relative to maintenance_margin_rate for the
+            # formula to represent a valid position (see compute_liquidation_price's
+            # docstring) — best-effort: skip margin modeling for this position
+            # rather than failing the whole tick loop over an edge case.
+            pass
 
     position_id = journal_db.insert_position(
         conn, symbol=order["symbol"], side=side, source="PAPER",
@@ -496,6 +503,17 @@ def _check_liquidation_exit(conn, position: dict, *, now, bid, ask, r: dict) -> 
     if not triggered:
         return False
 
+    # This engine's tick model is a single bid/ask POINT, not an OHLC range,
+    # so true same-candle ambiguity (outcome_simulator.py's AMBIGUOUS) can't
+    # happen between TP and liquidation/SL (opposite sides of entry) — but
+    # IS possible between liquidation and stop_loss if one tick's price move
+    # is large enough to cross both. Liquidation always wins (it's the
+    # exchange's forced action); intrabar_ambiguous records when that
+    # actually mattered, so downstream stats don't read this tick as a
+    # cleaner signal than a single point-sample can really support.
+    stop_loss = position.get("stop_loss")
+    sl_also_triggered = stop_loss is not None and ((bid <= stop_loss) if is_long else (ask >= stop_loss))
+
     remaining = _remaining_quantity(conn, position)
     if remaining > 0:
         total_qty = position["quantity"]
@@ -505,6 +523,7 @@ def _check_liquidation_exit(conn, position: dict, *, now, bid, ask, r: dict) -> 
         fill_id = journal_db.insert_fill(
             conn, position_id=position["id"], symbol=position["symbol"], side=position["side"],
             fill_type="LIQUIDATION", price=liq_price, quantity=remaining, realized_pnl_usdt=pnl, now=now,
+            intrabar_ambiguous=sl_also_triggered, resolution_policy="LIQUIDATION_FIRST",
         )
         r["fills_created"].append(fill_id)
 
@@ -535,6 +554,18 @@ def _update_checkpoints_and_extremes(conn, position: dict, trade_outcome: dict, 
 
 
 def _check_take_profit_exits(conn, position: dict, trade_plan: dict | None, *, now, bid, ask, settings, r: dict) -> bool:
+    """Margin-model policy (deliberate choice, not an oversight): a partial
+    TP close does NOT recompute `positions.liquidation_price` — it stays
+    fixed at the value computed from the original entry. Only the LOSS at
+    liquidation time is prorated (initial_margin_usdt * remaining_fraction,
+    see _check_liquidation_exit) to reflect that isolated margin frees up
+    proportionally to closed size at a fixed leverage. This is simple and
+    deterministic, at the cost of not modeling any actual margin/leverage
+    adjustment a trader might make after a partial close. Contrast with
+    `update_position_add_fill`, which DOES recompute liquidation_price —
+    there the average entry price itself changes, so the old value would be
+    outright wrong, not just a simplification.
+    """
     if trade_plan is not None:
         take_profits = trade_plan.get("take_profits") or []
         if take_profits:

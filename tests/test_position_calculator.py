@@ -11,6 +11,8 @@ dashboard integration layer's job in a later iteration, per the plan).
 
 from decimal import Decimal
 
+import pytest
+
 from risk_manager import (
     BingXInputMode,
     EntryPriceMode,
@@ -475,3 +477,57 @@ def test_compute_liquidation_price_high_leverage_can_be_closer_than_a_typical_st
 
 def test_compute_maintenance_margin_usdt_hand_computed():
     assert compute_maintenance_margin_usdt(Decimal("1000"), Decimal("0.005")) == Decimal("5.0")
+
+
+# ---------------------------------------------------------------------------
+# compute_liquidation_price — boundary/edge cases
+# ---------------------------------------------------------------------------
+
+
+def test_compute_liquidation_price_leverage_one_is_far_from_entry():
+    # No leverage = very hard to liquidate; liq sits close to zero (entry * mmr).
+    liq = compute_liquidation_price(Decimal("100"), 1, "LONG", Decimal("0.005"))
+    assert liq == Decimal("0.5")
+    assert liq < Decimal("100") * Decimal("0.1")  # nowhere near a normally-reachable range
+
+
+def test_compute_liquidation_price_leverage_100_still_valid():
+    liq = compute_liquidation_price(Decimal("100"), 100, "LONG", Decimal("0.005"))
+    assert liq == Decimal("99.5")
+    assert Decimal("0") < liq < Decimal("100")
+
+
+def test_compute_liquidation_price_rejects_leverage_below_one():
+    with pytest.raises(ValueError):
+        compute_liquidation_price(Decimal("100"), 0, "LONG", Decimal("0.005"))
+
+
+def test_compute_liquidation_price_rejects_negative_leverage():
+    with pytest.raises(ValueError):
+        compute_liquidation_price(Decimal("100"), -5, "LONG", Decimal("0.005"))
+
+
+def test_compute_liquidation_price_rejects_negative_maintenance_margin_rate():
+    with pytest.raises(ValueError):
+        compute_liquidation_price(Decimal("100"), 10, "LONG", Decimal("-0.001"))
+
+
+def test_compute_liquidation_price_rejects_leverage_too_high_for_mmr():
+    # At mmr=0.005, leverage >= 200 means 1/leverage <= mmr — initial margin
+    # would not even exceed maintenance margin, i.e. maintenance_margin_usdt
+    # >= initial_margin_usdt for the same notional. Not a valid position.
+    mmr = Decimal("0.005")
+    notional = Decimal("1000")
+    leverage = 200
+    initial_margin = notional / leverage
+    maintenance_margin = compute_maintenance_margin_usdt(notional, mmr)
+    assert maintenance_margin >= initial_margin  # confirms the inverted relationship this guards against
+
+    with pytest.raises(ValueError):
+        compute_liquidation_price(Decimal("100"), leverage, "LONG", mmr)
+
+
+def test_compute_liquidation_price_just_under_the_threshold_is_still_valid():
+    # leverage=199 leaves a razor-thin but positive margin above maintenance.
+    liq = compute_liquidation_price(Decimal("100"), 199, "LONG", Decimal("0.005"))
+    assert Decimal("0") < liq < Decimal("100")

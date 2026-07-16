@@ -786,8 +786,27 @@ def compute_liquidation_price(
 
         LONG:  entry * (1 - 1/leverage + maintenance_margin_rate)
         SHORT: entry * (1 + 1/leverage - maintenance_margin_rate)
+
+    Raises ValueError for inputs the formula can't represent meaningfully:
+    leverage < 1 (undefined), negative maintenance_margin_rate, or leverage
+    so high relative to maintenance_margin_rate that initial margin
+    (1/leverage of notional) would not even exceed maintenance margin —
+    at that point the position would already be below its maintenance
+    threshold the instant it opened, which isn't a real, valid position.
+    Callers (paper_trading.py) treat this as "margin modeling doesn't
+    apply at this leverage" and fall back to no liquidation tracking
+    rather than propagating the error into the tick loop.
     """
+    if leverage < 1:
+        raise ValueError(f"leverage must be >= 1, got {leverage}")
+    if maintenance_margin_rate < 0:
+        raise ValueError(f"maintenance_margin_rate must be >= 0, got {maintenance_margin_rate}")
     inverse_leverage = Decimal(1) / Decimal(leverage)
+    if inverse_leverage <= maintenance_margin_rate:
+        raise ValueError(
+            f"leverage {leverage}x leaves no room above maintenance_margin_rate "
+            f"{maintenance_margin_rate} — initial margin would not exceed maintenance margin"
+        )
     if side == "LONG":
         return entry_price * (Decimal(1) - inverse_leverage + maintenance_margin_rate)
     return entry_price * (Decimal(1) + inverse_leverage - maintenance_margin_rate)

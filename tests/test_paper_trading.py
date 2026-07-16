@@ -452,12 +452,15 @@ def _open_and_fill_long(conn, *, stop_loss=98.0, take_profits=None, valid_for_mi
     return plan_id, journal_db.get_open_positions(conn, "ETHUSDT")[0]
 
 
-def _open_and_fill_short(conn, *, stop_loss=103.0, take_profits=None, valid_for_minutes=15):
+def _open_and_fill_short(conn, *, stop_loss=103.0, take_profits=None, valid_for_minutes=15, risk_settings=DEFAULT_RISK_SETTINGS):
     if take_profits is None:
         take_profits = [("TP1", 95.0, 100.0)]
-    plan_id = _open_trade_plan(conn, signal="SHORT", entry_from=100.0, entry_to=101.0, stop_loss=stop_loss, take_profits=take_profits, valid_for_minutes=valid_for_minutes)
+    plan_id = _open_trade_plan(
+        conn, signal="SHORT", entry_from=100.0, entry_to=101.0, stop_loss=stop_loss, take_profits=take_profits,
+        valid_for_minutes=valid_for_minutes, risk_settings=risk_settings,
+    )
     paper_trading.open_virtual_order(conn, plan_id)
-    _tick(conn, bid=100.5, ask=100.6, now=NOW_EPOCH)
+    _tick(conn, bid=100.5, ask=100.6, now=NOW_EPOCH, settings=risk_settings)
     return plan_id, journal_db.get_open_positions(conn, "ETHUSDT")[0]
 
 
@@ -664,6 +667,9 @@ def test_partial_liquidation_loss_prorated_to_remaining_fraction_after_tp1(conn)
     _tick(conn, bid=104.1, ask=104.2, now=NOW_EPOCH + 30)
     remaining = journal_db.get_open_positions(conn, "ETHUSDT")[0]
     assert remaining["status"] == "OPEN"
+    # Policy: a partial TP does NOT recompute liquidation_price — it stays
+    # fixed at the value from the original entry (see _check_take_profit_exits).
+    assert remaining["liquidation_price"] == position["liquidation_price"]
 
     # Then price reverses hard and liquidates the remaining 60%.
     liq_price = remaining["liquidation_price"]
@@ -705,6 +711,98 @@ def test_unrealized_pnl_updates_each_tick(conn):
     expected = (Decimal("101.0") - position["entry_price"]) * position["quantity"]
     assert updated["unrealized_pnl_usdt"] == expected
     assert updated["unrealized_pnl_usdt"] > 0
+
+
+def test_liquidation_triggers_at_exact_price_long(conn):
+    high_leverage_settings = dataclasses.replace(DEFAULT_RISK_SETTINGS, leverage=50, max_margin_percent=Decimal("100"))
+    plan_id, position = _open_and_fill_long(conn, stop_loss=98.0, risk_settings=high_leverage_settings)
+    liq_price = position["liquidation_price"]
+    # bid == liq_price exactly (comparator is <=, so equality must trigger).
+    result = _tick(conn, bid=float(liq_price), ask=float(liq_price) + 0.1, now=NOW_EPOCH + 60)
+    assert result.positions_closed == [position["id"]]
+    closed = conn.execute("SELECT status FROM positions WHERE id = ?", (position["id"],)).fetchone()
+    assert closed["status"] == "LIQUIDATED"
+
+
+def test_liquidation_triggers_at_exact_price_short(conn):
+    high_leverage_settings = dataclasses.replace(DEFAULT_RISK_SETTINGS, leverage=50, max_margin_percent=Decimal("100"))
+    plan_id, position = _open_and_fill_short(conn, stop_loss=103.0, risk_settings=high_leverage_settings)
+    liq_price = position["liquidation_price"]
+    # ask == liq_price exactly (comparator is >=, so equality must trigger).
+    result = _tick(conn, bid=float(liq_price) - 0.1, ask=float(liq_price), now=NOW_EPOCH + 60)
+    assert result.positions_closed == [position["id"]]
+    closed = conn.execute("SELECT status FROM positions WHERE id = ?", (position["id"],)).fetchone()
+    assert closed["status"] == "LIQUIDATED"
+
+
+def test_liquidation_and_stop_loss_crossed_same_tick_liquidation_wins(conn):
+    # At leverage=50, liquidation (98.5) sits CLOSER to entry than the stop
+    # (98.0) — a single tick whose price move is big enough to clear the
+    # stop necessarily also clears liquidation. LIQUIDATION_FIRST applies,
+    # and intrabar_ambiguous records that the stop was ALSO crossed.
+    high_leverage_settings = dataclasses.replace(DEFAULT_RISK_SETTINGS, leverage=50, max_margin_percent=Decimal("100"))
+    plan_id, position = _open_and_fill_long(conn, stop_loss=98.0, risk_settings=high_leverage_settings)
+    assert position["liquidation_price"] > Decimal("98.0")
+
+    result = _tick(conn, bid=97.0, ask=97.1, now=NOW_EPOCH + 60)
+    assert result.positions_closed == [position["id"]]
+
+    closed = conn.execute("SELECT status FROM positions WHERE id = ?", (position["id"],)).fetchone()
+    assert closed["status"] == "LIQUIDATED"
+
+    fills = journal_db.get_position_fills(conn, position["id"])
+    assert not any(f["fill_type"] == "STOP_LOSS" for f in fills)
+    liquidation_fill = next(f for f in fills if f["fill_type"] == "LIQUIDATION")
+    assert liquidation_fill["intrabar_ambiguous"] is True
+    assert liquidation_fill["resolution_policy"] == "LIQUIDATION_FIRST"
+
+
+def test_liquidation_fill_not_ambiguous_when_stop_loss_not_also_crossed(conn):
+    high_leverage_settings = dataclasses.replace(DEFAULT_RISK_SETTINGS, leverage=50, max_margin_percent=Decimal("100"))
+    plan_id, position = _open_and_fill_long(conn, stop_loss=98.0, risk_settings=high_leverage_settings)
+    liq_price = position["liquidation_price"]
+    # Between liquidation (98.5) and the stop (98.0) — crosses liquidation only.
+    _tick(conn, bid=float(liq_price) - 0.01, ask=float(liq_price) + 0.05, now=NOW_EPOCH + 60)
+    liquidation_fill = next(
+        f for f in journal_db.get_position_fills(conn, position["id"]) if f["fill_type"] == "LIQUIDATION"
+    )
+    assert liquidation_fill["intrabar_ambiguous"] is False
+    assert liquidation_fill["resolution_policy"] == "LIQUIDATION_FIRST"
+
+
+def test_check_liquidation_exit_creates_no_fill_once_remaining_is_zero(conn):
+    # Direct test of the private function: even if it were somehow invoked
+    # on a position whose remaining quantity is already 0 (fully closed by
+    # something else), it must not fabricate a new LIQUIDATION fill.
+    plan_id, position = _open_and_fill_long(conn, stop_loss=98.0, take_profits=[("TP1", 105.0, 100.0)])
+    _tick(conn, bid=105.1, ask=105.2, now=NOW_EPOCH + 30)  # TP1 (100%) fully closes it
+    closed_position = conn.execute("SELECT * FROM positions WHERE id = ?", (position["id"],)).fetchone()
+    assert closed_position["status"] == "CLOSED"
+
+    position_dict = dict(closed_position)
+    position_dict["entry_price"] = Decimal(position_dict["entry_price"])
+    position_dict["quantity"] = Decimal(position_dict["quantity"])
+    position_dict["liquidation_price"] = Decimal("1000.0")  # force triggered=True for the direct call
+    position_dict["initial_margin_usdt"] = Decimal(position_dict["initial_margin_usdt"] or "0")
+    position_dict["stop_loss"] = Decimal(position_dict["stop_loss"]) if position_dict["stop_loss"] else None
+
+    fills_before = len(journal_db.get_position_fills(conn, position["id"]))
+    r = dict(fills_created=[], positions_closed=[])
+    paper_trading._check_liquidation_exit(conn, position_dict, now=NOW_EPOCH + 90, bid=Decimal("1000.0"), ask=Decimal("1000.1"), r=r)
+    fills_after = len(journal_db.get_position_fills(conn, position["id"]))
+    assert fills_after == fills_before
+    assert r["fills_created"] == []
+
+
+def test_open_position_with_extreme_leverage_skips_margin_modeling(conn):
+    # leverage=200 with the default 0.005 maintenance_margin_rate is exactly
+    # the threshold where compute_liquidation_price raises ValueError —
+    # opening the position must not crash the tick, just skip margin fields.
+    extreme_settings = dataclasses.replace(DEFAULT_RISK_SETTINGS, leverage=200, max_margin_percent=Decimal("100"))
+    plan_id, position = _open_and_fill_long(conn, stop_loss=98.0, risk_settings=extreme_settings)
+    assert position["liquidation_price"] is None
+    assert position["initial_margin_usdt"] is None
+    assert position["maintenance_margin_usdt"] is None
 
 
 # ---------------------------------------------------------------------------
