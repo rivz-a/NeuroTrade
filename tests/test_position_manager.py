@@ -244,9 +244,13 @@ def test_manage_stop_loss_short_side_breakeven(conn, monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def test_check_time_based_close_no_op_before_max_hold(conn):
-    snap_id = None
-    # Build a minimal trade_plan so mode is resolvable.
+def test_check_time_based_close_no_op_before_max_hold(conn, monkeypatch):
+    # Freeze "now" as seen by time.time() inside the module under test —
+    # NOW_EPOCH is a fixed past date, so without this the real wall clock
+    # would read as "way past max_hold" and the function would fall through
+    # into its close path, hitting the real (unmocked) bingx_client/
+    # bingx_private_client network calls.
+    monkeypatch.setattr(position_manager.time, "time", lambda: NOW_EPOCH)
     plan_id = _minimal_trade_plan(conn, mode="scalping")
     position_id = _open_position(conn, trade_plan_id=plan_id, opened_at=NOW_EPOCH)
     result = position_manager.check_time_based_close(conn, position_id)
@@ -295,6 +299,45 @@ def test_check_regime_close_long_closes_on_trend_down(conn, monkeypatch):
     assert journal_db.get_position(conn, position_id)["status"] == "CLOSED"
     fills = journal_db.get_position_fills(conn, position_id)
     assert any(f["fill_type"] == "REGIME_CHANGE" for f in fills)
+
+
+def test_no_double_close_when_multiple_exit_checks_run_after_one_closes(conn, monkeypatch):
+    # execution_engine.monitor() runs manage_stop_loss -> check_regime_close ->
+    # check_data_quality_close -> check_time_based_close in sequence for the
+    # same position. Each one re-fetches the position fresh and bails out if
+    # it's no longer OPEN, so once the FIRST check closes it, none of the
+    # later ones should place a second market-close order.
+    plan_id = _minimal_trade_plan(conn, mode="scalping")
+    opened_at = NOW_EPOCH - config.PAPER_TRADING_MAX_HOLD_SECONDS["scalping"] - 10  # also past time-based close
+    position_id = _open_position(conn, side="LONG", trade_plan_id=plan_id, opened_at=opened_at)
+
+    close_order_calls = {"n": 0}
+
+    def _place_order(symbol, side, position_side, order_type, quantity, **kwargs):
+        if order_type == "MARKET":
+            close_order_calls["n"] += 1
+        return {"orderId": f"close-{close_order_calls['n']}"}
+
+    monkeypatch.setattr(bingx_client, "get_price", lambda symbol: 99.0)
+    monkeypatch.setattr(bingx_private_client, "place_order", _place_order)
+    monkeypatch.setattr(position_manager.time, "time", lambda: NOW_EPOCH)
+
+    # regime AND data-quality would BOTH independently justify closing —
+    # deliberately stacking two true triggers to prove only one close fires.
+    assert position_manager.check_regime_close(conn, position_id, current_regime=_regime("TREND_DOWN")) is True
+    assert close_order_calls["n"] == 1
+    assert journal_db.get_position(conn, position_id)["status"] == "CLOSED"
+
+    # Every subsequent check must be a safe no-op — no second market-close order.
+    assert position_manager.check_data_quality_close(conn, position_id, current_data_quality="NO_TRADE") is False
+    assert position_manager.check_time_based_close(conn, position_id) is False
+    assert position_manager.manage_stop_loss(conn, position_id) is None
+    assert close_order_calls["n"] == 1
+
+    fills = journal_db.get_position_fills(conn, position_id)
+    close_fills = [f for f in fills if f["fill_type"] in ("REGIME_CHANGE", "DATA_QUALITY", "TIMEOUT")]
+    assert len(close_fills) == 1
+    assert close_fills[0]["fill_type"] == "REGIME_CHANGE"
 
 
 def test_check_regime_close_long_ignores_range(conn):

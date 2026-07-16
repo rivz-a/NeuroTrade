@@ -42,42 +42,51 @@ def _today_bounds(now: float) -> tuple[float, float]:
     return start, start + 86400
 
 
-def _today_real_stats(conn, symbol: str, now: float) -> tuple[int, Decimal, float | None]:
+def _today_account_stats(conn, now: float) -> tuple[int, Decimal, float | None]:
     """Returns (entry orders placed today, sum of today's realized REAL PnL,
-    epoch of the most recent REAL stop-loss fill or None). An entry order is
+    epoch of the most recent REAL stop-loss fill or None) — ACCOUNT-WIDE,
+    with no `symbol` filter. These three numbers back the kill-switch-
+    adjacent global gates (daily loss limit, max trades/day, cooldown after
+    a stop): the whole point of an account-wide loss limit is that it stays
+    correct even if this app is ever run against more than one symbol —
+    a limit that quietly resets per-symbol would let losses on one
+    instrument keep trading approved on another. An entry order is
     identified by stop_loss/take_profit both being NULL on its real_orders
     row — see order_manager.place_entry_order's comment on why those fields
     are reserved for SL/TP rows only.
+
+    PnL is summed in Python via Decimal, not SQLite's CAST(...AS REAL) —
+    the column is stored as exact-text Decimal (see journal_db._dec_to_text)
+    specifically so a safety-critical check like this never round-trips
+    through binary floating point.
     """
     start, end = _today_bounds(now)
 
     trade_count_row = conn.execute(
         """
         SELECT COUNT(*) AS c FROM real_orders
-        WHERE symbol = ? AND stop_loss IS NULL AND take_profit IS NULL
+        WHERE stop_loss IS NULL AND take_profit IS NULL
           AND status != 'REJECTED' AND created_at >= ? AND created_at < ?
         """,
-        (symbol, start, end),
+        (start, end),
     ).fetchone()
     trade_count = trade_count_row["c"] if trade_count_row else 0
 
-    pnl_row = conn.execute(
+    pnl_rows = conn.execute(
         """
-        SELECT COALESCE(SUM(CAST(f.realized_pnl_usdt AS REAL)), 0) AS total
-        FROM fills f JOIN positions p ON p.id = f.position_id
-        WHERE p.source = 'REAL' AND f.symbol = ? AND f.fill_type != 'ENTRY'
+        SELECT f.realized_pnl_usdt FROM fills f JOIN positions p ON p.id = f.position_id
+        WHERE p.source = 'REAL' AND f.fill_type != 'ENTRY' AND f.realized_pnl_usdt IS NOT NULL
           AND f.filled_at >= ? AND f.filled_at < ?
         """,
-        (symbol, start, end),
-    ).fetchone()
-    daily_pnl = Decimal(str(pnl_row["total"])) if pnl_row else Decimal("0")
+        (start, end),
+    ).fetchall()
+    daily_pnl = sum((Decimal(row["realized_pnl_usdt"]) for row in pnl_rows), Decimal("0"))
 
     last_stop_row = conn.execute(
         """
         SELECT MAX(f.filled_at) AS t FROM fills f JOIN positions p ON p.id = f.position_id
-        WHERE p.source = 'REAL' AND f.symbol = ? AND f.fill_type = 'STOP_LOSS'
-        """,
-        (symbol,),
+        WHERE p.source = 'REAL' AND f.fill_type = 'STOP_LOSS'
+        """
     ).fetchone()
     last_stop_time = last_stop_row["t"] if last_stop_row and last_stop_row["t"] is not None else None
 
@@ -99,9 +108,8 @@ def confirm_and_execute(conn, trade_plan_id: int, *, now: float | None = None) -
     trade_plan = journal_db.get_trade_plan(conn, trade_plan_id)
     if trade_plan is None:
         return _rejected("trade plan not found")
-    symbol = trade_plan["symbol"]
 
-    trade_count, daily_pnl, last_stop_time = _today_real_stats(conn, symbol, now)
+    trade_count, daily_pnl, last_stop_time = _today_account_stats(conn, now)
 
     if daily_pnl <= -Decimal(str(config.EXECUTION_DAILY_LOSS_LIMIT_USDT)):
         return _rejected(

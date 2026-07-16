@@ -116,6 +116,7 @@ def _open_trade_plan(
     valid_for_minutes: int = 15,
     formed_at: float | None = None,
     mode: str = "scalping",
+    entry_type: str = "LIMIT_ZONE",
 ) -> int:
     """Full market_snapshot -> feature_snapshot -> strategy_score -> trade_plan
     chain, with a REAL risk_manager.PositionCalculator computing position
@@ -143,7 +144,7 @@ def _open_trade_plan(
         )
         calculation = PositionCalculator(DEFAULT_RISK_SETTINGS).calculate(scenario)
         plan = SelectedPlan(
-            source_label="GPT-4o mini", entry_status="ENTER_NOW", entry_type="LIMIT_ZONE",
+            source_label="GPT-4o mini", entry_status="ENTER_NOW", entry_type=entry_type,
             entry_from=entry_from, entry_to=entry_to, stop_loss=stop_loss,
             take_profits=list(take_profits), risk_reward_tp1=2.0,
             time_horizon_minutes=30, valid_for_minutes=valid_for_minutes, formed_at=formed_at,
@@ -278,6 +279,59 @@ def test_short_entry_fills_when_bid_enters_zone(conn):
     positions = journal_db.get_open_positions(conn, "ETHUSDT")
     expected = Decimal("100.5") * (1 - DEFAULT_RISK_SETTINGS.slippage_percent / Decimal("100"))
     assert positions[0]["entry_price"] == expected
+
+
+# ---------------------------------------------------------------------------
+# TRIGGER (breakout/breakdown) orders — regression coverage for the fixed
+# comparator direction (was reusing the LIMIT logic, backwards for a
+# breakout entry).
+# ---------------------------------------------------------------------------
+
+
+def test_long_trigger_does_not_fill_on_pullback_into_zone(conn):
+    plan_id = _open_trade_plan(conn, signal="LONG", entry_from=100.0, entry_to=101.0, entry_type="WAIT_BREAKOUT")
+    paper_trading.open_virtual_order(conn, plan_id)
+    # Ask sits inside the zone (would have wrongly filled a LIMIT-style check) —
+    # a breakout hasn't happened yet.
+    _tick(conn, bid=100.4, ask=100.5)
+    order = journal_db.get_paper_order_by_trade_plan_id(conn, plan_id)
+    assert order["order_type"] == "TRIGGER"
+    assert order["status"] == "PENDING"
+    assert journal_db.get_open_positions(conn, "ETHUSDT") == []
+
+
+def test_long_trigger_fills_when_ask_breaks_above_zone(conn):
+    plan_id = _open_trade_plan(conn, signal="LONG", entry_from=100.0, entry_to=101.0, entry_type="WAIT_BREAKOUT")
+    paper_trading.open_virtual_order(conn, plan_id)
+    _tick(conn, bid=101.4, ask=101.5)  # ask clears the zone's high (101.0)
+    order = journal_db.get_paper_order_by_trade_plan_id(conn, plan_id)
+    assert order["status"] == "FILLED"
+    assert journal_db.get_open_positions(conn, "ETHUSDT") != []
+
+
+def test_short_trigger_does_not_fill_on_pullback_into_zone(conn):
+    plan_id = _open_trade_plan(
+        conn, signal="SHORT", entry_from=100.0, entry_to=101.0, stop_loss=103.0,
+        take_profits=[("TP1", 95.0, 100.0)], entry_type="WAIT_BREAKOUT",
+    )
+    paper_trading.open_virtual_order(conn, plan_id)
+    _tick(conn, bid=100.5, ask=100.6)  # inside the zone — no breakdown yet
+    order = journal_db.get_paper_order_by_trade_plan_id(conn, plan_id)
+    assert order["order_type"] == "TRIGGER"
+    assert order["status"] == "PENDING"
+    assert journal_db.get_open_positions(conn, "ETHUSDT") == []
+
+
+def test_short_trigger_fills_when_bid_breaks_below_zone(conn):
+    plan_id = _open_trade_plan(
+        conn, signal="SHORT", entry_from=100.0, entry_to=101.0, stop_loss=103.0,
+        take_profits=[("TP1", 95.0, 100.0)], entry_type="WAIT_BREAKOUT",
+    )
+    paper_trading.open_virtual_order(conn, plan_id)
+    _tick(conn, bid=99.4, ask=99.5)  # bid clears below the zone's low (100.0)
+    order = journal_db.get_paper_order_by_trade_plan_id(conn, plan_id)
+    assert order["status"] == "FILLED"
+    assert journal_db.get_open_positions(conn, "ETHUSDT") != []
 
 
 def test_long_entry_not_touched_stays_pending(conn):

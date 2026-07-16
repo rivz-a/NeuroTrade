@@ -298,7 +298,17 @@ def _try_fill_order(
         touched = True
     elif order["entry_from"] is None:
         touched = False
-    else:
+    elif order_type == "TRIGGER":
+        # A breakout/breakdown trigger fires the OPPOSITE way from a limit
+        # zone: price must clear the far edge, not retrace into it. LONG
+        # needs ask to break ABOVE the zone's high; SHORT needs bid to break
+        # BELOW the zone's low. Using the LIMIT comparator here (as an
+        # earlier version of this function did) would fill a LONG breakout
+        # order on a pullback DOWN into the zone — backwards for what a
+        # breakout entry means.
+        lo, hi = min(order["entry_from"], order["entry_to"]), max(order["entry_from"], order["entry_to"])
+        touched = (ask >= Decimal(str(hi))) if side == "LONG" else (bid <= Decimal(str(lo)))
+    else:  # LIMIT
         lo, hi = min(order["entry_from"], order["entry_to"]), max(order["entry_from"], order["entry_to"])
         touched = (ask <= Decimal(str(hi))) if side == "LONG" else (bid >= Decimal(str(lo)))
 

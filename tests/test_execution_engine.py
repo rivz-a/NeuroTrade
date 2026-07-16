@@ -163,6 +163,61 @@ def test_confirm_and_execute_blocked_by_daily_loss_limit(conn, monkeypatch):
     assert "daily loss limit" in result.reason
 
 
+def test_confirm_and_execute_daily_loss_limit_is_account_wide_not_per_symbol(conn, monkeypatch):
+    # A loss booked on BTCUSDT must still block a fresh ETHUSDT trade — the
+    # gate is account-wide, not scoped to whichever symbol is being confirmed.
+    monkeypatch.setattr(config, "EXECUTION_DAILY_LOSS_LIMIT_USDT", 5.0)
+    plan_id = _minimal_trade_plan(conn, symbol="ETHUSDT")
+
+    position_id = journal_db.insert_position(
+        conn, symbol="BTCUSDT", side="LONG", source="REAL", entry_price=Decimal("60000"), quantity=Decimal("0.01"), status="CLOSED",
+    )
+    journal_db.insert_fill(
+        conn, position_id=position_id, symbol="BTCUSDT", side="LONG", fill_type="STOP_LOSS",
+        price=Decimal("59000"), quantity=Decimal("0.01"), realized_pnl_usdt=Decimal("-6.0"), now=NOW_EPOCH,
+    )
+
+    result = execution_engine.confirm_and_execute(conn, plan_id, now=NOW_EPOCH)
+    assert result.status == "REJECTED"
+    assert "daily loss limit" in result.reason
+
+
+def test_confirm_and_execute_cooldown_is_account_wide_not_per_symbol(conn, monkeypatch):
+    # A stop-loss fill on BTCUSDT must still trigger cooldown for a fresh
+    # ETHUSDT trade.
+    monkeypatch.setattr(config, "EXECUTION_COOLDOWN_AFTER_STOP_SECONDS", 1800)
+    plan_id = _minimal_trade_plan(conn, symbol="ETHUSDT")
+
+    position_id = journal_db.insert_position(
+        conn, symbol="BTCUSDT", side="LONG", source="REAL", entry_price=Decimal("60000"), quantity=Decimal("0.01"), status="CLOSED",
+    )
+    journal_db.insert_fill(
+        conn, position_id=position_id, symbol="BTCUSDT", side="LONG", fill_type="STOP_LOSS",
+        price=Decimal("59000"), quantity=Decimal("0.01"), realized_pnl_usdt=Decimal("-1.0"), now=NOW_EPOCH - 60,
+    )
+
+    result = execution_engine.confirm_and_execute(conn, plan_id, now=NOW_EPOCH)
+    assert result.status == "REJECTED"
+    assert "cooldown" in result.reason
+
+
+def test_confirm_and_execute_max_trades_is_account_wide_not_per_symbol(conn, monkeypatch):
+    # An entry order already placed today on BTCUSDT must still count
+    # against the max-trades-per-day gate for a fresh ETHUSDT trade.
+    monkeypatch.setattr(config, "EXECUTION_MAX_TRADES_PER_DAY", 1)
+    plan_id = _minimal_trade_plan(conn, symbol="ETHUSDT")
+    other_plan_id = _minimal_trade_plan(conn, symbol="BTCUSDT")
+
+    journal_db.insert_real_order(
+        conn, symbol="BTCUSDT", side="LONG", order_type="MARKET", quantity="0.01",
+        trade_plan_id=other_plan_id, status="OPEN", now=NOW_EPOCH,
+    )
+
+    result = execution_engine.confirm_and_execute(conn, plan_id, now=NOW_EPOCH)
+    assert result.status == "REJECTED"
+    assert "max trades" in result.reason
+
+
 def test_confirm_and_execute_blocked_by_max_trades_per_day(conn, monkeypatch):
     monkeypatch.setattr(config, "EXECUTION_MAX_TRADES_PER_DAY", 1)
     plan_id = _minimal_trade_plan(conn)
