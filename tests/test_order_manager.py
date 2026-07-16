@@ -314,11 +314,13 @@ def test_place_entry_order_dry_run_happy_path(conn):
     assert entry_row is not None
     assert entry_row["stop_loss"] is None  # entry row never carries stop_loss/take_profit
     assert entry_row["take_profit"] is None
+    assert entry_row["is_dry_run"] is True
 
     position = journal_db.get_open_positions(conn, "ETHUSDT", source="REAL")
     assert len(position) == 1
     assert position[0]["side"] == "LONG"
     assert position[0]["quantity"] > 0
+    assert position[0]["is_dry_run"] is True
 
     fills = journal_db.get_position_fills(conn, position[0]["id"])
     assert len(fills) == 1

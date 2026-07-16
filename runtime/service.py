@@ -119,8 +119,13 @@ class TradingRuntime:
             except Exception as exc:  # best-effort: one bad tick must not kill the runtime
                 errors.append(f"process_tick failed: {exc}")
 
+        # PAPER mode must stay entirely inert with respect to REAL state —
+        # execution_engine.monitor touches real_orders/positions (source=
+        # "REAL") even when EXECUTION_DRY_RUN short-circuits the actual
+        # network calls, so it only runs in a mode that's explicitly meant
+        # to watch REAL positions.
         real_monitor_ran = False
-        if now - self._last_medium_run >= config.RUNTIME_MEDIUM_INTERVAL_SECONDS:
+        if config.RUNTIME_MODE != "PAPER" and now - self._last_medium_run >= config.RUNTIME_MEDIUM_INTERVAL_SECONDS:
             try:
                 execution_engine.monitor(self._conn, self.symbol)
                 self._conn.commit()

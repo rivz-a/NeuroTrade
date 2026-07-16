@@ -531,6 +531,7 @@ def manage_stop_loss(conn, position_id: int, *, now: float | None = None) -> str
         status="OPEN",
         now=now,
         exchange_order_id=new_exchange_id,
+        is_dry_run=config.EXECUTION_DRY_RUN,
     )
     journal_db.update_position_stop_loss(conn, position_id, candidate_stop, now=now)
     return stage

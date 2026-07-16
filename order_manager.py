@@ -246,6 +246,7 @@ def _place_exit_order(
         now=now,
         notes=("DRY_RUN: signed request built, not sent" if config.EXECUTION_DRY_RUN else None),
         label=label,
+        is_dry_run=config.EXECUTION_DRY_RUN,
     )
     try:
         data = bingx_private_client.place_order(
@@ -355,6 +356,7 @@ def place_entry_order(conn, trade_plan_id: int, *, now: float | None = None) -> 
         status="PENDING",
         now=now,
         notes=("DRY_RUN: signed request built, not sent" if config.EXECUTION_DRY_RUN else None),
+        is_dry_run=config.EXECUTION_DRY_RUN,
     )
     real_order_ids = [entry_order_id]
 
@@ -495,6 +497,7 @@ def place_entry_order(conn, trade_plan_id: int, *, now: float | None = None) -> 
             real_order_id=entry_order_id,
             status="OPEN",
             now=now,
+            is_dry_run=config.EXECUTION_DRY_RUN,
         )
         journal_db.insert_fill(
             conn,

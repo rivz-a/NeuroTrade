@@ -182,6 +182,40 @@ def test_confirm_and_execute_daily_loss_limit_is_account_wide_not_per_symbol(con
     assert "daily loss limit" in result.reason
 
 
+def test_confirm_and_execute_ignores_dry_run_losses_in_daily_limit(conn, monkeypatch):
+    # A DRY_RUN "loss" (order_manager still writes local rows in DRY_RUN so
+    # the pipeline is exercisable offline, per Stage 11) must never count
+    # toward the REAL daily loss limit — it never happened on the exchange.
+    monkeypatch.setattr(config, "EXECUTION_DAILY_LOSS_LIMIT_USDT", 5.0)
+    plan_id = _minimal_trade_plan(conn, symbol="ETHUSDT")
+
+    position_id = journal_db.insert_position(
+        conn, symbol="ETHUSDT", side="LONG", source="REAL", entry_price=Decimal("100"), quantity=Decimal("0.1"),
+        status="CLOSED", is_dry_run=True,
+    )
+    journal_db.insert_fill(
+        conn, position_id=position_id, symbol="ETHUSDT", side="LONG", fill_type="STOP_LOSS",
+        price=Decimal("98"), quantity=Decimal("0.1"), realized_pnl_usdt=Decimal("-50.0"), now=NOW_EPOCH,
+    )
+
+    result = execution_engine.confirm_and_execute(conn, plan_id, now=NOW_EPOCH)
+    assert result.status != "REJECTED" or "daily loss limit" not in (result.reason or "")
+
+
+def test_confirm_and_execute_ignores_dry_run_trades_in_max_trades_count(conn, monkeypatch):
+    monkeypatch.setattr(config, "EXECUTION_MAX_TRADES_PER_DAY", 1)
+    plan_id = _minimal_trade_plan(conn, symbol="ETHUSDT")
+    other_plan_id = _minimal_trade_plan(conn, symbol="ETHUSDT")
+
+    journal_db.insert_real_order(
+        conn, symbol="ETHUSDT", side="LONG", order_type="MARKET", quantity="0.01",
+        trade_plan_id=other_plan_id, status="OPEN", now=NOW_EPOCH, is_dry_run=True,
+    )
+
+    result = execution_engine.confirm_and_execute(conn, plan_id, now=NOW_EPOCH)
+    assert result.status != "REJECTED" or "max trades" not in (result.reason or "")
+
+
 def test_confirm_and_execute_cooldown_is_account_wide_not_per_symbol(conn, monkeypatch):
     # A stop-loss fill on BTCUSDT must still trigger cooldown for a fresh
     # ETHUSDT trade.

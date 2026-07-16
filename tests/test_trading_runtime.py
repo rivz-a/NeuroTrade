@@ -97,8 +97,8 @@ def test_run_once_does_not_call_paper_tick_in_monitor_only_mode(conn, monkeypatc
 
 
 def test_run_once_calls_monitor_only_when_medium_interval_elapsed(conn, monkeypatch):
+    monkeypatch.setattr(config, "RUNTIME_MODE", "MONITOR_ONLY")
     monkeypatch.setattr(market_data_engine, "collect_snapshot", lambda symbol, now=None: _snapshot("GOOD"))
-    monkeypatch.setattr(paper_trading, "process_tick", lambda c, symbol, now=None: None)
     monitor_calls = []
     monkeypatch.setattr(execution_engine, "monitor", lambda c, symbol: monitor_calls.append(symbol))
 
@@ -114,6 +114,21 @@ def test_run_once_calls_monitor_only_when_medium_interval_elapsed(conn, monkeypa
     result3 = runtime.run_once(now=NOW + 11)  # past the medium interval
     assert result3.real_monitor_ran is True
     assert monitor_calls == ["ETHUSDT", "ETHUSDT"]
+
+
+def test_run_once_never_calls_monitor_in_paper_mode(conn, monkeypatch):
+    # PAPER mode must stay entirely inert with respect to REAL state, even
+    # though the medium interval has long since elapsed.
+    monkeypatch.setattr(market_data_engine, "collect_snapshot", lambda symbol, now=None: _snapshot("GOOD"))
+    monkeypatch.setattr(paper_trading, "process_tick", lambda c, symbol, now=None: None)
+    monkeypatch.setattr(
+        execution_engine, "monitor",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("monitor should never run in PAPER mode")),
+    )
+
+    runtime = TradingRuntime("ETHUSDT", conn=conn)
+    result = runtime.run_once(now=NOW)
+    assert result.real_monitor_ran is False
 
 
 def test_run_once_survives_collect_snapshot_failure(conn, monkeypatch):

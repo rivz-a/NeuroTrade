@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import sqlite3
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 _MARKET_SNAPSHOTS = """
 CREATE TABLE IF NOT EXISTS market_snapshots (
@@ -284,6 +284,7 @@ CREATE TABLE IF NOT EXISTS real_orders (
     take_profits_json   TEXT NOT NULL DEFAULT '[]',
     label               TEXT,
     exchange_order_id   TEXT UNIQUE,
+    is_dry_run          INTEGER NOT NULL DEFAULT 0,
     created_at          REAL NOT NULL,
     updated_at          REAL NOT NULL,
     closed_at           REAL,
@@ -318,6 +319,7 @@ CREATE TABLE IF NOT EXISTS positions (
     initial_margin_usdt      TEXT,
     maintenance_margin_usdt  TEXT,
     liquidation_price        TEXT,
+    is_dry_run            INTEGER NOT NULL DEFAULT 0,
     opened_at             REAL NOT NULL,
     closed_at             REAL,
     notes                 TEXT

@@ -59,13 +59,20 @@ def _today_account_stats(conn, now: float) -> tuple[int, Decimal, float | None]:
     the column is stored as exact-text Decimal (see journal_db._dec_to_text)
     specifically so a safety-critical check like this never round-trips
     through binary floating point.
+
+    Everything here excludes is_dry_run=1 rows. order_manager.py still
+    writes real_orders/positions rows while config.EXECUTION_DRY_RUN is
+    true (so the full pipeline is exercisable end-to-end offline), but a
+    simulated fill must never be mistaken for a real one — least of all
+    here, where it would otherwise let fabricated DRY_RUN losses block (or
+    fabricated DRY_RUN activity artificially permit) an actual live trade.
     """
     start, end = _today_bounds(now)
 
     trade_count_row = conn.execute(
         """
         SELECT COUNT(*) AS c FROM real_orders
-        WHERE stop_loss IS NULL AND take_profit IS NULL
+        WHERE stop_loss IS NULL AND take_profit IS NULL AND is_dry_run = 0
           AND status != 'REJECTED' AND created_at >= ? AND created_at < ?
         """,
         (start, end),
@@ -75,8 +82,8 @@ def _today_account_stats(conn, now: float) -> tuple[int, Decimal, float | None]:
     pnl_rows = conn.execute(
         """
         SELECT f.realized_pnl_usdt FROM fills f JOIN positions p ON p.id = f.position_id
-        WHERE p.source = 'REAL' AND f.fill_type != 'ENTRY' AND f.realized_pnl_usdt IS NOT NULL
-          AND f.filled_at >= ? AND f.filled_at < ?
+        WHERE p.source = 'REAL' AND p.is_dry_run = 0 AND f.fill_type != 'ENTRY'
+          AND f.realized_pnl_usdt IS NOT NULL AND f.filled_at >= ? AND f.filled_at < ?
         """,
         (start, end),
     ).fetchall()
@@ -85,7 +92,7 @@ def _today_account_stats(conn, now: float) -> tuple[int, Decimal, float | None]:
     last_stop_row = conn.execute(
         """
         SELECT MAX(f.filled_at) AS t FROM fills f JOIN positions p ON p.id = f.position_id
-        WHERE p.source = 'REAL' AND f.fill_type = 'STOP_LOSS'
+        WHERE p.source = 'REAL' AND p.is_dry_run = 0 AND f.fill_type = 'STOP_LOSS'
         """
     ).fetchone()
     last_stop_time = last_stop_row["t"] if last_stop_row and last_stop_row["t"] is not None else None

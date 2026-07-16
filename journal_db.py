@@ -728,6 +728,7 @@ def _insert_order(
     entry_from: float | None = None,
     entry_to: float | None = None,
     label: str | None = None,
+    is_dry_run: bool = False,
 ) -> int:
     now = now if now is not None else time.time()
     columns = [
@@ -767,9 +768,10 @@ def _insert_order(
         "notes": notes,
     }
     if table == "real_orders":
-        columns.extend(["exchange_order_id", "label"])
+        columns.extend(["exchange_order_id", "label", "is_dry_run"])
         params["exchange_order_id"] = exchange_order_id
         params["label"] = label
+        params["is_dry_run"] = int(is_dry_run)
     if table == "paper_orders":
         columns.extend(["entry_from", "entry_to"])
         params["entry_from"] = entry_from
@@ -844,6 +846,7 @@ def insert_real_order(
     now: float | None = None,
     exchange_order_id: str | None = None,
     label: str | None = None,
+    is_dry_run: bool = False,
 ) -> int:
     return _insert_order(
         conn,
@@ -865,6 +868,7 @@ def insert_real_order(
         now=now,
         exchange_order_id=exchange_order_id,
         label=label,
+        is_dry_run=is_dry_run,
     )
 
 
@@ -907,18 +911,27 @@ def insert_position(
     initial_margin_usdt: Decimal | str | None = None,
     maintenance_margin_usdt: Decimal | str | None = None,
     liquidation_price: Decimal | str | None = None,
+    is_dry_run: bool = False,
 ) -> int:
+    """`is_dry_run` marks a REAL position that was created while
+    config.EXECUTION_DRY_RUN was true — order_manager still writes it (so
+    the full pipeline is exercisable end-to-end offline), but it must
+    never be mistaken for a real fill. execution_engine's account-wide
+    safety-limit aggregation (_today_account_stats) excludes it explicitly;
+    get_open_positions does NOT exclude it, so duplicate-order/one-
+    position-per-instrument checks stay exercisable in DRY_RUN tests.
+    """
     now = now if now is not None else time.time()
     cur = conn.execute(
         """
         INSERT INTO positions (
             trade_plan_id, paper_order_id, real_order_id, source, symbol, side, status,
             entry_price, quantity, leverage, margin_mode, stop_loss, take_profit, opened_at,
-            initial_margin_usdt, maintenance_margin_usdt, liquidation_price
+            initial_margin_usdt, maintenance_margin_usdt, liquidation_price, is_dry_run
         ) VALUES (
             :trade_plan_id, :paper_order_id, :real_order_id, :source, :symbol, :side, :status,
             :entry_price, :quantity, :leverage, :margin_mode, :stop_loss, :take_profit, :opened_at,
-            :initial_margin_usdt, :maintenance_margin_usdt, :liquidation_price
+            :initial_margin_usdt, :maintenance_margin_usdt, :liquidation_price, :is_dry_run
         )
         """,
         {
@@ -939,6 +952,7 @@ def insert_position(
             "initial_margin_usdt": _norm_dec_text(initial_margin_usdt),
             "maintenance_margin_usdt": _norm_dec_text(maintenance_margin_usdt),
             "liquidation_price": _norm_dec_text(liquidation_price),
+            "is_dry_run": int(is_dry_run),
         },
     )
     return cur.lastrowid
@@ -1529,6 +1543,7 @@ _POSITION_DECIMAL_FIELDS = (
     "realized_pnl_usdt", "unrealized_pnl_usdt", "fees_paid_usdt",
     "initial_margin_usdt", "maintenance_margin_usdt", "liquidation_price",
 )
+_POSITION_BOOL_FIELDS = ("is_dry_run",)
 _FILL_DECIMAL_FIELDS = ("price", "quantity", "fee_usdt", "realized_pnl_usdt")
 
 
@@ -1556,19 +1571,19 @@ def get_open_positions(conn: sqlite3.Connection, symbol: str, source: str = "PAP
     rows = conn.execute(
         "SELECT * FROM positions WHERE symbol = ? AND source = ? AND status = 'OPEN' ORDER BY id", (symbol, source)
     ).fetchall()
-    return [_row_to_dict(r, decimal_fields=_POSITION_DECIMAL_FIELDS) for r in rows]
+    return [_row_to_dict(r, decimal_fields=_POSITION_DECIMAL_FIELDS, bool_fields=_POSITION_BOOL_FIELDS) for r in rows]
 
 
 def get_position(conn: sqlite3.Connection, position_id: int) -> dict | None:
     row = conn.execute("SELECT * FROM positions WHERE id = ?", (position_id,)).fetchone()
-    return _row_to_dict(row, decimal_fields=_POSITION_DECIMAL_FIELDS) if row is not None else None
+    return _row_to_dict(row, decimal_fields=_POSITION_DECIMAL_FIELDS, bool_fields=_POSITION_BOOL_FIELDS) if row is not None else None
 
 
 def get_position_by_paper_order_id(conn: sqlite3.Connection, paper_order_id: int) -> dict | None:
     row = conn.execute(
         "SELECT * FROM positions WHERE paper_order_id = ? AND status = 'OPEN'", (paper_order_id,)
     ).fetchone()
-    return _row_to_dict(row, decimal_fields=_POSITION_DECIMAL_FIELDS) if row is not None else None
+    return _row_to_dict(row, decimal_fields=_POSITION_DECIMAL_FIELDS, bool_fields=_POSITION_BOOL_FIELDS) if row is not None else None
 
 
 def get_position_fills(conn: sqlite3.Connection, position_id: int) -> list[dict]:
@@ -1586,6 +1601,7 @@ def get_position_fills(conn: sqlite3.Connection, position_id: int) -> list[dict]
 
 _REAL_ORDER_JSON_FIELDS = ("take_profits_json",)
 _REAL_ORDER_DECIMAL_FIELDS = ("price", "trigger_price", "quantity", "filled_quantity", "stop_loss", "take_profit")
+_REAL_ORDER_BOOL_FIELDS = ("is_dry_run",)
 
 
 def get_real_order_by_trade_plan_id(conn: sqlite3.Connection, trade_plan_id: int) -> dict | None:
@@ -1595,7 +1611,10 @@ def get_real_order_by_trade_plan_id(conn: sqlite3.Connection, trade_plan_id: int
     """
     row = conn.execute("SELECT * FROM real_orders WHERE trade_plan_id = ?", (trade_plan_id,)).fetchone()
     return (
-        _row_to_dict(row, json_fields=_REAL_ORDER_JSON_FIELDS, decimal_fields=_REAL_ORDER_DECIMAL_FIELDS)
+        _row_to_dict(
+            row, json_fields=_REAL_ORDER_JSON_FIELDS, decimal_fields=_REAL_ORDER_DECIMAL_FIELDS,
+            bool_fields=_REAL_ORDER_BOOL_FIELDS,
+        )
         if row is not None
         else None
     )
@@ -1610,7 +1629,13 @@ def get_pending_real_orders(conn: sqlite3.Connection, symbol: str) -> list[dict]
         "SELECT * FROM real_orders WHERE symbol = ? AND status IN ('PENDING','OPEN','PARTIALLY_FILLED') ORDER BY id",
         (symbol,),
     ).fetchall()
-    return [_row_to_dict(r, json_fields=_REAL_ORDER_JSON_FIELDS, decimal_fields=_REAL_ORDER_DECIMAL_FIELDS) for r in rows]
+    return [
+        _row_to_dict(
+            r, json_fields=_REAL_ORDER_JSON_FIELDS, decimal_fields=_REAL_ORDER_DECIMAL_FIELDS,
+            bool_fields=_REAL_ORDER_BOOL_FIELDS,
+        )
+        for r in rows
+    ]
 
 
 def set_real_order_exchange_id(
@@ -1639,7 +1664,10 @@ def get_entry_real_order_for_trade_plan(conn: sqlite3.Connection, trade_plan_id:
         (trade_plan_id,),
     ).fetchone()
     return (
-        _row_to_dict(row, json_fields=_REAL_ORDER_JSON_FIELDS, decimal_fields=_REAL_ORDER_DECIMAL_FIELDS)
+        _row_to_dict(
+            row, json_fields=_REAL_ORDER_JSON_FIELDS, decimal_fields=_REAL_ORDER_DECIMAL_FIELDS,
+            bool_fields=_REAL_ORDER_BOOL_FIELDS,
+        )
         if row is not None
         else None
     )
@@ -1652,7 +1680,7 @@ def get_position_by_trade_plan_id(conn: sqlite3.Connection, trade_plan_id: int) 
     later for LIMIT/TRIGGER once BingX confirms the fill).
     """
     row = conn.execute("SELECT * FROM positions WHERE trade_plan_id = ?", (trade_plan_id,)).fetchone()
-    return _row_to_dict(row, decimal_fields=_POSITION_DECIMAL_FIELDS) if row is not None else None
+    return _row_to_dict(row, decimal_fields=_POSITION_DECIMAL_FIELDS, bool_fields=_POSITION_BOOL_FIELDS) if row is not None else None
 
 
 def reduce_position_quantity(

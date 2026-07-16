@@ -291,9 +291,14 @@ EXECUTION_TRAILING_STOP_R_MULTIPLE = float(os.getenv("EXECUTION_TRAILING_STOP_R_
 # runtime/ (trading_runtime.py): the long-lived process that actually calls
 # paper_trading.process_tick/execution_engine.monitor on a schedule — every
 # engine before this stage was deliberately "called from outside," with no
-# loop of its own. RUNTIME_MODE="MONITOR_ONLY" skips paper simulation and
-# only watches already-open REAL positions + data quality; it never places
-# a new real order (execution_engine.confirm_and_execute stays a separate,
+# loop of its own. The two modes are mutually exclusive on purpose:
+# "PAPER" runs ONLY paper_trading.process_tick — it must stay entirely
+# inert with respect to real_orders/positions(source="REAL"), even though
+# EXECUTION_DRY_RUN would short-circuit any actual network call, so
+# execution_engine.monitor is never invoked in this mode at all.
+# "MONITOR_ONLY" runs ONLY execution_engine.monitor (already-open REAL
+# positions + data quality) — no paper simulation. Neither mode places a
+# new real order (execution_engine.confirm_and_execute stays a separate,
 # manual action) — so there's no distinct "SEMI_AUTO"/"AUTO" runtime mode
 # yet, both would behave identically to plain monitoring today.
 RUNTIME_MODE = os.getenv("RUNTIME_MODE", "PAPER").strip().upper()
