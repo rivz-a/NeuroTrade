@@ -288,6 +288,21 @@ EXECUTION_PRICE_ZONE_TOLERANCE_FRACTION = 0.0005
 # of the position's original risk (R) behind it.
 EXECUTION_TRAILING_STOP_R_MULTIPLE = float(os.getenv("EXECUTION_TRAILING_STOP_R_MULTIPLE", "1.0"))
 
+# runtime/ (trading_runtime.py): the long-lived process that actually calls
+# paper_trading.process_tick/execution_engine.monitor on a schedule — every
+# engine before this stage was deliberately "called from outside," with no
+# loop of its own. RUNTIME_MODE="MONITOR_ONLY" skips paper simulation and
+# only watches already-open REAL positions + data quality; it never places
+# a new real order (execution_engine.confirm_and_execute stays a separate,
+# manual action) — so there's no distinct "SEMI_AUTO"/"AUTO" runtime mode
+# yet, both would behave identically to plain monitoring today.
+RUNTIME_MODE = os.getenv("RUNTIME_MODE", "PAPER").strip().upper()
+RUNTIME_FAST_INTERVAL_SECONDS = float(os.getenv("RUNTIME_FAST_INTERVAL_SECONDS", "2"))
+RUNTIME_MEDIUM_INTERVAL_SECONDS = float(os.getenv("RUNTIME_MEDIUM_INTERVAL_SECONDS", "10"))
+RUNTIME_LOCK_FILE = Path(__file__).resolve().parent / "runtime.lock"
+RUNTIME_HEARTBEAT_FILE = Path(__file__).resolve().parent / "runtime_heartbeat.json"
+RUNTIME_HEARTBEAT_STALE_SECONDS = float(os.getenv("RUNTIME_HEARTBEAT_STALE_SECONDS", "15"))
+
 
 @dataclass(frozen=True)
 class AIModelConfig:

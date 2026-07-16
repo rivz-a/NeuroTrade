@@ -15,4 +15,6 @@ journal.db-wal
 journal.db-shm
 journal.db-journal
 kill_switch.flag
+runtime.lock
+runtime_heartbeat.json
 *.log
