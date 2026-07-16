@@ -61,9 +61,9 @@ import config
 import journal_db
 import risk_settings_store
 from outcome_simulator import SimulatedOutcome
-from risk_manager import RiskSettings
+from risk_manager import RiskSettings, compute_liquidation_price, compute_maintenance_margin_usdt
 
-_EXIT_REASONS = ("SL", "TP1", "TP2", "TP3", "TIMEOUT", "AMBIGUOUS")
+_EXIT_REASONS = ("SL", "TP1", "TP2", "TP3", "TIMEOUT", "AMBIGUOUS", "LIQUIDATION")
 
 
 # ---------------------------------------------------------------------------
@@ -358,12 +358,23 @@ def _get_or_grow_position_for_order(conn, order: dict, *, side: str, fill_price:
         journal_db.update_position_add_fill(conn, existing["id"], additional_quantity=fill_qty, fill_price=fill_price, now=now)
         return existing["id"], False
 
+    leverage = order.get("leverage")
+    initial_margin_usdt = maintenance_margin_usdt = liquidation_price = None
+    if leverage:
+        mmr = Decimal(str(config.PAPER_TRADING_MAINTENANCE_MARGIN_RATE))
+        notional = fill_price * fill_qty
+        initial_margin_usdt = notional / leverage
+        maintenance_margin_usdt = compute_maintenance_margin_usdt(notional, mmr)
+        liquidation_price = compute_liquidation_price(fill_price, leverage, side, mmr)
+
     position_id = journal_db.insert_position(
         conn, symbol=order["symbol"], side=side, source="PAPER",
         entry_price=fill_price, quantity=fill_qty,
-        leverage=order.get("leverage"), margin_mode=order.get("margin_mode"),
+        leverage=leverage, margin_mode=order.get("margin_mode"),
         stop_loss=order["stop_loss"], take_profit=order["take_profit"],
         trade_plan_id=order.get("trade_plan_id"), paper_order_id=order["id"], status="OPEN", now=now,
+        initial_margin_usdt=initial_margin_usdt, maintenance_margin_usdt=maintenance_margin_usdt,
+        liquidation_price=liquidation_price,
     )
     trade_plan_id = order.get("trade_plan_id")
     if trade_plan_id is not None:
@@ -439,13 +450,65 @@ def _advance_open_position(conn, position: dict, *, now, bid, ask, settings, r: 
 
     if trade_outcome is not None:
         _update_checkpoints_and_extremes(conn, position, trade_outcome, now=now, bid=bid, ask=ask)
+    _update_unrealized_pnl(conn, position, bid=bid, ask=ask)
 
+    # Liquidation is checked first: it's the exchange's own forced action,
+    # which in reality preempts/cancels resting SL/TP orders — a stop loss
+    # is just a reserved order, not a guarantee it fires before liquidation
+    # at high leverage.
+    if _check_liquidation_exit(conn, position, now=now, bid=bid, ask=ask, r=r):
+        return
     if _check_take_profit_exits(conn, position, trade_plan, now=now, bid=bid, ask=ask, settings=settings, r=r):
         return
     if _check_stop_loss_exit(conn, position, now=now, bid=bid, ask=ask, settings=settings, r=r):
         return
     _apply_trailing_stop(conn, position, now=now, bid=bid, ask=ask, r=r)
     _check_time_based_close(conn, position, trade_plan, now=now, bid=bid, ask=ask, settings=settings, r=r)
+
+
+def _update_unrealized_pnl(conn, position: dict, *, bid: Decimal, ask: Decimal) -> None:
+    """Gross mark-to-market PnL (no fee deduction, matching what an
+    exchange UI typically shows) — recorded every tick for any OPEN
+    position, independent of whether it has a trade_plan_id/trade_outcome.
+    """
+    is_long = position["side"] == "LONG"
+    mark_price = bid if is_long else ask
+    gross = (mark_price - position["entry_price"]) * position["quantity"] if is_long else (position["entry_price"] - mark_price) * position["quantity"]
+    journal_db.update_position_unrealized_pnl(conn, position["id"], gross)
+
+
+def _check_liquidation_exit(conn, position: dict, *, now, bid, ask, r: dict) -> bool:
+    """Forced full close at the position's precomputed liquidation_price
+    (see risk_manager.compute_liquidation_price) — a position with no
+    leverage on record has no liquidation_price and this is a no-op.
+    Losing the ENTIRE margin allocated to whatever quantity is still open
+    (not a price-delta P&L like a normal exit) is the defining behavior of
+    isolated-margin liquidation: the loss is capped at the margin put up,
+    prorated to the remaining fraction if earlier take-profits already
+    reduced the position (paper positions never physically shrink
+    `quantity` on a partial close — see _remaining_quantity).
+    """
+    liq_price = position.get("liquidation_price")
+    if liq_price is None:
+        return False
+    is_long = position["side"] == "LONG"
+    triggered = (bid <= liq_price) if is_long else (ask >= liq_price)
+    if not triggered:
+        return False
+
+    remaining = _remaining_quantity(conn, position)
+    if remaining > 0:
+        total_qty = position["quantity"]
+        initial_margin = position.get("initial_margin_usdt") or Decimal("0")
+        remaining_fraction = (remaining / total_qty) if total_qty else Decimal("0")
+        pnl = -(initial_margin * remaining_fraction)
+        fill_id = journal_db.insert_fill(
+            conn, position_id=position["id"], symbol=position["symbol"], side=position["side"],
+            fill_type="LIQUIDATION", price=liq_price, quantity=remaining, realized_pnl_usdt=pnl, now=now,
+        )
+        r["fills_created"].append(fill_id)
+
+    return _finalize_if_closed(conn, position, now=now, r=r, status="LIQUIDATED")
 
 
 def _update_checkpoints_and_extremes(conn, position: dict, trade_outcome: dict, *, now, bid, ask) -> None:
@@ -586,12 +649,14 @@ def _map_fill_to_exit_reason(fill: dict) -> str:
         return "SL"
     if fill["fill_type"] == "TIMEOUT":
         return "TIMEOUT"
+    if fill["fill_type"] == "LIQUIDATION":
+        return "LIQUIDATION"
     if fill["fill_type"] == "TAKE_PROFIT":
         return fill["label"]
     return "TIMEOUT"
 
 
-def _finalize_if_closed(conn, position: dict, *, now: float, r: dict) -> bool:
+def _finalize_if_closed(conn, position: dict, *, now: float, r: dict, status: Literal["CLOSED", "LIQUIDATED"] = "CLOSED") -> bool:
     if _remaining_quantity(conn, position) > 0:
         return False
 
@@ -604,7 +669,10 @@ def _finalize_if_closed(conn, position: dict, *, now: float, r: dict) -> bool:
     total_fees = sum((f["fee_usdt"] or Decimal("0")) for f in fills)
     total_pnl = sum((f["realized_pnl_usdt"] or Decimal("0")) for f in closing_fills)
 
-    journal_db.close_position(conn, position["id"], exit_price=last_fill["price"], realized_pnl_usdt=total_pnl, fees_paid_usdt=total_fees, now=now)
+    journal_db.close_position(
+        conn, position["id"], exit_price=last_fill["price"], realized_pnl_usdt=total_pnl,
+        fees_paid_usdt=total_fees, now=now, status=status,
+    )
     r["positions_closed"].append(position["id"])
 
     trade_plan_id = position.get("trade_plan_id")

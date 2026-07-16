@@ -51,7 +51,12 @@ from feature_engine import FeatureSet
 from market_data_engine import MarketDataSnapshot
 from market_regime import RegimeResult
 from outcome_simulator import SimulatedOutcome
-from risk_manager import BingXManualFields, PositionCalculation
+from risk_manager import (
+    BingXManualFields,
+    PositionCalculation,
+    compute_liquidation_price,
+    compute_maintenance_margin_usdt,
+)
 from strategy_engine import ScoreResult
 
 # ---------------------------------------------------------------------------
@@ -899,16 +904,21 @@ def insert_position(
     real_order_id: int | None = None,
     status: str = "OPEN",
     now: float | None = None,
+    initial_margin_usdt: Decimal | str | None = None,
+    maintenance_margin_usdt: Decimal | str | None = None,
+    liquidation_price: Decimal | str | None = None,
 ) -> int:
     now = now if now is not None else time.time()
     cur = conn.execute(
         """
         INSERT INTO positions (
             trade_plan_id, paper_order_id, real_order_id, source, symbol, side, status,
-            entry_price, quantity, leverage, margin_mode, stop_loss, take_profit, opened_at
+            entry_price, quantity, leverage, margin_mode, stop_loss, take_profit, opened_at,
+            initial_margin_usdt, maintenance_margin_usdt, liquidation_price
         ) VALUES (
             :trade_plan_id, :paper_order_id, :real_order_id, :source, :symbol, :side, :status,
-            :entry_price, :quantity, :leverage, :margin_mode, :stop_loss, :take_profit, :opened_at
+            :entry_price, :quantity, :leverage, :margin_mode, :stop_loss, :take_profit, :opened_at,
+            :initial_margin_usdt, :maintenance_margin_usdt, :liquidation_price
         )
         """,
         {
@@ -926,6 +936,9 @@ def insert_position(
             "stop_loss": _norm_dec_text(stop_loss),
             "take_profit": _norm_dec_text(take_profit),
             "opened_at": now,
+            "initial_margin_usdt": _norm_dec_text(initial_margin_usdt),
+            "maintenance_margin_usdt": _norm_dec_text(maintenance_margin_usdt),
+            "liquidation_price": _norm_dec_text(liquidation_price),
         },
     )
     return cur.lastrowid
@@ -939,14 +952,28 @@ def close_position(
     realized_pnl_usdt: Decimal | str | None = None,
     fees_paid_usdt: Decimal | str | None = None,
     now: float | None = None,
+    status: Literal["CLOSED", "LIQUIDATED"] = "CLOSED",
 ) -> None:
     now = now if now is not None else time.time()
     conn.execute(
         """
-        UPDATE positions SET status = 'CLOSED', exit_price = ?, realized_pnl_usdt = ?,
+        UPDATE positions SET status = ?, exit_price = ?, realized_pnl_usdt = ?,
             fees_paid_usdt = ?, closed_at = ? WHERE id = ?
         """,
-        (_norm_dec_text(exit_price), _norm_dec_text(realized_pnl_usdt), _norm_dec_text(fees_paid_usdt), now, position_id),
+        (status, _norm_dec_text(exit_price), _norm_dec_text(realized_pnl_usdt), _norm_dec_text(fees_paid_usdt), now, position_id),
+    )
+
+
+def update_position_unrealized_pnl(
+    conn: sqlite3.Connection, position_id: int, unrealized_pnl_usdt: Decimal | str, *, now: float | None = None
+) -> None:
+    """Mark-to-market PnL for an OPEN position — gross (price delta only,
+    no fee deduction), matching what an exchange UI typically shows. `now`
+    accepted for signature symmetry, unused (see update_position_stop_loss).
+    """
+    conn.execute(
+        "UPDATE positions SET unrealized_pnl_usdt = ? WHERE id = ?",
+        (_norm_dec_text(unrealized_pnl_usdt), position_id),
     )
 
 
@@ -976,15 +1003,42 @@ def update_position_add_fill(
     Python with Decimal, write back) since SQLite has no Decimal type to do
     the weighted-average arithmetic itself.
     """
-    row = conn.execute("SELECT entry_price, quantity FROM positions WHERE id = ?", (position_id,)).fetchone()
+    row = conn.execute("SELECT entry_price, quantity, side, leverage FROM positions WHERE id = ?", (position_id,)).fetchone()
     old_price, old_qty = _text_to_dec(row["entry_price"]), _text_to_dec(row["quantity"])
     add_qty = Decimal(_norm_dec_text(additional_quantity))
     add_price = Decimal(_norm_dec_text(fill_price))
     new_qty = old_qty + add_qty
     new_price = (old_price * old_qty + add_price * add_qty) / new_qty
+
+    # The average entry price (and total size) just moved, so a previously-
+    # computed liquidation price/margin (anchored to the FIRST fill) would
+    # now be stale — recompute against the new weighted-average entry and
+    # new total quantity, same as at initial open. Skipped (stays NULL) if
+    # leverage isn't set.
+    liquidation_price = None
+    maintenance_margin_usdt = None
+    initial_margin_usdt = None
+    if row["leverage"]:
+        mmr = Decimal(str(config.PAPER_TRADING_MAINTENANCE_MARGIN_RATE))
+        new_notional = new_price * new_qty
+        liquidation_price = compute_liquidation_price(new_price, row["leverage"], row["side"], mmr)
+        maintenance_margin_usdt = compute_maintenance_margin_usdt(new_notional, mmr)
+        initial_margin_usdt = new_notional / row["leverage"]
+
     conn.execute(
-        "UPDATE positions SET entry_price = ?, quantity = ? WHERE id = ?",
-        (_dec_to_text(new_price), _dec_to_text(new_qty), position_id),
+        """
+        UPDATE positions SET entry_price = ?, quantity = ?, liquidation_price = ?,
+            maintenance_margin_usdt = ?, initial_margin_usdt = COALESCE(?, initial_margin_usdt)
+        WHERE id = ?
+        """,
+        (
+            _dec_to_text(new_price),
+            _dec_to_text(new_qty),
+            _dec_to_text(liquidation_price),
+            _dec_to_text(maintenance_margin_usdt),
+            _dec_to_text(initial_margin_usdt),
+            position_id,
+        ),
     )
 
 
@@ -1451,6 +1505,7 @@ _PAPER_ORDER_DECIMAL_FIELDS = ("price", "trigger_price", "quantity", "filled_qua
 _POSITION_DECIMAL_FIELDS = (
     "entry_price", "quantity", "stop_loss", "take_profit", "exit_price",
     "realized_pnl_usdt", "unrealized_pnl_usdt", "fees_paid_usdt",
+    "initial_margin_usdt", "maintenance_margin_usdt", "liquidation_price",
 )
 _FILL_DECIMAL_FIELDS = ("price", "quantity", "fee_usdt", "realized_pnl_usdt")
 

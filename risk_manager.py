@@ -766,3 +766,28 @@ def build_bingx_manual_fields(
         notional_usdt=calculation.bingx_fields.get("NOTIONAL_USDT", calculation.position_notional_usdt),
         coin_quantity=calculation.bingx_fields.get("COIN_QUANTITY", calculation.position_size_coin_rounded),
         )
+
+
+def compute_maintenance_margin_usdt(notional_usdt: Decimal, maintenance_margin_rate: Decimal) -> Decimal:
+    return notional_usdt * maintenance_margin_rate
+
+
+def compute_liquidation_price(
+    entry_price: Decimal, leverage: int, side: Literal["LONG", "SHORT"], maintenance_margin_rate: Decimal
+) -> Decimal:
+    """Isolated-margin liquidation price — a standard approximation that
+    ignores funding payments and the exact notional-tiered maintenance-
+    margin schedule real exchanges use (see
+    config.PAPER_TRADING_MAINTENANCE_MARGIN_RATE for why a flat rate is
+    used instead). Used by paper_trading.py to model the real risk that,
+    at high leverage, price can reach liquidation BEFORE it reaches a
+    resting stop loss — the stop is just a reserved order; liquidation is
+    the exchange's own forced action and knows nothing about it.
+
+        LONG:  entry * (1 - 1/leverage + maintenance_margin_rate)
+        SHORT: entry * (1 + 1/leverage - maintenance_margin_rate)
+    """
+    inverse_leverage = Decimal(1) / Decimal(leverage)
+    if side == "LONG":
+        return entry_price * (Decimal(1) - inverse_leverage + maintenance_margin_rate)
+    return entry_price * (Decimal(1) + inverse_leverage - maintenance_margin_rate)

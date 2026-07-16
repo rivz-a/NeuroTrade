@@ -20,6 +20,8 @@ from risk_manager import (
     RiskSettings,
     TakeProfitTarget,
     TradeScenario,
+    compute_liquidation_price,
+    compute_maintenance_margin_usdt,
 )
 
 
@@ -435,3 +437,41 @@ def test_blended_result_is_none_without_take_profits():
     scenario = _scenario(take_profits=[])
     result = PositionCalculator(_settings()).calculate(scenario)
     assert result.blended is None
+
+
+# ---------------------------------------------------------------------------
+# compute_liquidation_price / compute_maintenance_margin_usdt
+# (Stage: margin/liquidation modeling for paper_trading.py)
+# ---------------------------------------------------------------------------
+
+
+def test_compute_liquidation_price_long_hand_computed():
+    # entry=100, leverage=5, mmr=0.005 -> 100 * (1 - 0.2 + 0.005) = 80.5
+    liq = compute_liquidation_price(Decimal("100"), 5, "LONG", Decimal("0.005"))
+    assert liq == Decimal("80.5")
+
+
+def test_compute_liquidation_price_short_hand_computed():
+    # entry=100, leverage=5, mmr=0.005 -> 100 * (1 + 0.2 - 0.005) = 119.5
+    liq = compute_liquidation_price(Decimal("100"), 5, "SHORT", Decimal("0.005"))
+    assert liq == Decimal("119.5")
+
+
+def test_compute_liquidation_price_higher_leverage_is_closer_to_entry():
+    low_leverage_liq = compute_liquidation_price(Decimal("100"), 5, "LONG", Decimal("0.005"))
+    high_leverage_liq = compute_liquidation_price(Decimal("100"), 50, "LONG", Decimal("0.005"))
+    assert high_leverage_liq > low_leverage_liq  # closer to entry (100) than the 5x case
+
+
+def test_compute_liquidation_price_high_leverage_can_be_closer_than_a_typical_stop():
+    # This is the realistic danger the liquidation model exists to surface:
+    # at 50x, liquidation (98.5) sits BETWEEN entry (100) and a stop_loss of
+    # 98 — price reaches liquidation before the stop is even touched.
+    liq = compute_liquidation_price(Decimal("100"), 50, "LONG", Decimal("0.005"))
+    assert liq == Decimal("98.5")
+    stop_loss = Decimal("98.0")
+    assert liq > stop_loss
+
+
+def test_compute_maintenance_margin_usdt_hand_computed():
+    assert compute_maintenance_margin_usdt(Decimal("1000"), Decimal("0.005")) == Decimal("5.0")

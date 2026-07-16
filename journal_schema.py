@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import sqlite3
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 _MARKET_SNAPSHOTS = """
 CREATE TABLE IF NOT EXISTS market_snapshots (
@@ -315,6 +315,9 @@ CREATE TABLE IF NOT EXISTS positions (
     realized_pnl_usdt     TEXT,
     unrealized_pnl_usdt   TEXT,
     fees_paid_usdt        TEXT,
+    initial_margin_usdt      TEXT,
+    maintenance_margin_usdt  TEXT,
+    liquidation_price        TEXT,
     opened_at             REAL NOT NULL,
     closed_at             REAL,
     notes                 TEXT
@@ -360,7 +363,7 @@ CREATE TABLE IF NOT EXISTS trade_outcomes (
     price_after_5m       REAL,
     price_after_15m      REAL,
     price_after_30m      REAL,
-    exit_reason          TEXT CHECK (exit_reason IN ('SL','TP1','TP2','TP3','TIMEOUT','AMBIGUOUS') OR exit_reason IS NULL),
+    exit_reason          TEXT CHECK (exit_reason IN ('SL','TP1','TP2','TP3','TIMEOUT','AMBIGUOUS','LIQUIDATION') OR exit_reason IS NULL),
     exit_price           REAL,
     exit_time             REAL,
     duration_seconds      REAL,

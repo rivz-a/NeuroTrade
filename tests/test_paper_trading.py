@@ -9,6 +9,7 @@ matches this repo's per-file-duplication test convention).
 
 from __future__ import annotations
 
+import dataclasses
 from datetime import datetime, timezone
 from decimal import Decimal
 
@@ -32,7 +33,7 @@ from feature_engine import (
 from market_data_engine import MarketDataSnapshot
 from market_regime import RegimeResult
 from outcome_simulator import SimulatedOutcome
-from risk_manager import DEFAULT_RISK_SETTINGS, PositionCalculator, TakeProfitTarget, TradeScenario
+from risk_manager import DEFAULT_RISK_SETTINGS, PositionCalculator, RiskSettings, TakeProfitTarget, TradeScenario
 from strategy_engine import Contribution, ScoreResult
 
 NOW = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
@@ -117,6 +118,7 @@ def _open_trade_plan(
     formed_at: float | None = None,
     mode: str = "scalping",
     entry_type: str = "LIMIT_ZONE",
+    risk_settings: RiskSettings = DEFAULT_RISK_SETTINGS,
 ) -> int:
     """Full market_snapshot -> feature_snapshot -> strategy_score -> trade_plan
     chain, with a REAL risk_manager.PositionCalculator computing position
@@ -142,7 +144,7 @@ def _open_trade_plan(
             stop_loss=Decimal(str(stop_loss)),
             take_profits=[TakeProfitTarget(label, Decimal(str(price)), Decimal(str(pct))) for label, price, pct in take_profits],
         )
-        calculation = PositionCalculator(DEFAULT_RISK_SETTINGS).calculate(scenario)
+        calculation = PositionCalculator(risk_settings).calculate(scenario)
         plan = SelectedPlan(
             source_label="GPT-4o mini", entry_status="ENTER_NOW", entry_type=entry_type,
             entry_from=entry_from, entry_to=entry_to, stop_loss=stop_loss,
@@ -440,10 +442,13 @@ def test_order_without_trade_plan_never_expires(conn):
 # ---------------------------------------------------------------------------
 
 
-def _open_and_fill_long(conn, *, stop_loss=98.0, take_profits=None, valid_for_minutes=15):
-    plan_id = _open_trade_plan(conn, signal="LONG", entry_from=100.0, entry_to=101.0, stop_loss=stop_loss, take_profits=take_profits, valid_for_minutes=valid_for_minutes)
+def _open_and_fill_long(conn, *, stop_loss=98.0, take_profits=None, valid_for_minutes=15, risk_settings=DEFAULT_RISK_SETTINGS):
+    plan_id = _open_trade_plan(
+        conn, signal="LONG", entry_from=100.0, entry_to=101.0, stop_loss=stop_loss, take_profits=take_profits,
+        valid_for_minutes=valid_for_minutes, risk_settings=risk_settings,
+    )
     paper_trading.open_virtual_order(conn, plan_id)
-    _tick(conn, bid=100.4, ask=100.5, now=NOW_EPOCH)
+    _tick(conn, bid=100.4, ask=100.5, now=NOW_EPOCH, settings=risk_settings)
     return plan_id, journal_db.get_open_positions(conn, "ETHUSDT")[0]
 
 
@@ -585,6 +590,121 @@ def test_trailing_stop_short_mirrors_long(conn):
     assert result.stops_trailed == [position["id"]]
     updated = conn.execute("SELECT stop_loss FROM positions WHERE id = ?", (position["id"],)).fetchone()
     assert Decimal(updated["stop_loss"]) == entry_price
+
+
+# ---------------------------------------------------------------------------
+# Margin / liquidation modeling
+# ---------------------------------------------------------------------------
+
+
+def test_open_position_records_margin_and_liquidation_price(conn):
+    plan_id, position = _open_and_fill_long(conn, stop_loss=98.0)
+    entry_price = position["entry_price"]
+    quantity = position["quantity"]
+    mmr = Decimal(str(config.PAPER_TRADING_MAINTENANCE_MARGIN_RATE))
+
+    expected_liq = entry_price * (Decimal(1) - Decimal(1) / DEFAULT_RISK_SETTINGS.leverage + mmr)
+    expected_initial_margin = entry_price * quantity / DEFAULT_RISK_SETTINGS.leverage
+    expected_maintenance_margin = entry_price * quantity * mmr
+
+    assert position["liquidation_price"] == expected_liq
+    assert position["initial_margin_usdt"] == expected_initial_margin
+    assert position["maintenance_margin_usdt"] == expected_maintenance_margin
+
+
+def test_moderate_leverage_stop_loss_fires_before_liquidation(conn):
+    # At the default leverage (5x), the stop is much closer to entry than
+    # liquidation — the normal, safe case.
+    plan_id, position = _open_and_fill_long(conn, stop_loss=98.0)
+    assert position["stop_loss"] > position["liquidation_price"]
+
+    result = _tick(conn, bid=97.9, ask=98.0, now=NOW_EPOCH + 60)
+    assert result.positions_closed == [position["id"]]
+    closed = conn.execute("SELECT status FROM positions WHERE id = ?", (position["id"],)).fetchone()
+    assert closed["status"] == "CLOSED"  # not LIQUIDATED — the stop got there first
+    fills = journal_db.get_position_fills(conn, position["id"])
+    assert any(f["fill_type"] == "STOP_LOSS" for f in fills)
+    assert not any(f["fill_type"] == "LIQUIDATION" for f in fills)
+
+
+def test_high_leverage_liquidation_fires_before_stop_loss_is_reached(conn):
+    # The realistic danger this model exists to surface: at 50x leverage, the
+    # liquidation price sits BETWEEN entry and a stop_loss that would
+    # normally be considered safe — the position is forcibly liquidated
+    # before price ever reaches the stop.
+    high_leverage_settings = dataclasses.replace(DEFAULT_RISK_SETTINGS, leverage=50, max_margin_percent=Decimal("100"))
+    plan_id, position = _open_and_fill_long(conn, stop_loss=98.0, risk_settings=high_leverage_settings)
+    assert position["liquidation_price"] > position["stop_loss"]  # liquidation is CLOSER to entry than the stop
+
+    # Price falls toward (but not below) the stop — liquidation triggers first.
+    liq_price = position["liquidation_price"]
+    result = _tick(conn, bid=float(liq_price) - 0.05, ask=float(liq_price) + 0.05, now=NOW_EPOCH + 60)
+    assert result.positions_closed == [position["id"]]
+
+    closed = conn.execute("SELECT status, realized_pnl_usdt FROM positions WHERE id = ?", (position["id"],)).fetchone()
+    assert closed["status"] == "LIQUIDATED"
+    assert Decimal(closed["realized_pnl_usdt"]) == -position["initial_margin_usdt"]
+
+    fills = journal_db.get_position_fills(conn, position["id"])
+    assert any(f["fill_type"] == "LIQUIDATION" for f in fills)
+    assert not any(f["fill_type"] == "STOP_LOSS" for f in fills)
+
+    outcome = journal_db.get_trade_outcome(conn, plan_id)
+    assert outcome["exit_reason"] == "LIQUIDATION"
+
+
+def test_partial_liquidation_loss_prorated_to_remaining_fraction_after_tp1(conn):
+    high_leverage_settings = dataclasses.replace(DEFAULT_RISK_SETTINGS, leverage=50, max_margin_percent=Decimal("100"))
+    plan_id, position = _open_and_fill_long(
+        conn, stop_loss=98.0, take_profits=[("TP1", 104.0, 40.0), ("TP2", 110.0, 60.0)], risk_settings=high_leverage_settings,
+    )
+    initial_margin = position["initial_margin_usdt"]
+
+    # TP1 (40%, at price 104.0) fills first.
+    _tick(conn, bid=104.1, ask=104.2, now=NOW_EPOCH + 30)
+    remaining = journal_db.get_open_positions(conn, "ETHUSDT")[0]
+    assert remaining["status"] == "OPEN"
+
+    # Then price reverses hard and liquidates the remaining 60%.
+    liq_price = remaining["liquidation_price"]
+    _tick(conn, bid=float(liq_price) - 0.05, ask=float(liq_price) + 0.05, now=NOW_EPOCH + 60)
+
+    closed = conn.execute("SELECT status, realized_pnl_usdt FROM positions WHERE id = ?", (position["id"],)).fetchone()
+    assert closed["status"] == "LIQUIDATED"
+    liquidation_fill = next(f for f in journal_db.get_position_fills(conn, position["id"]) if f["fill_type"] == "LIQUIDATION")
+    expected_loss = -(initial_margin * Decimal("0.6"))
+    assert liquidation_fill["realized_pnl_usdt"] == expected_loss
+
+
+def test_update_position_add_fill_recomputes_liquidation_price(conn):
+    high_leverage_settings = dataclasses.replace(DEFAULT_RISK_SETTINGS, leverage=50, max_margin_percent=Decimal("100"))
+    plan_id = _open_trade_plan(
+        conn, signal="LONG", entry_from=100.0, entry_to=101.0, stop_loss=98.0, risk_settings=high_leverage_settings,
+    )
+    paper_trading.open_virtual_order(conn, plan_id)
+    # First tick fills part of the order at ~100.5; a later tick at a
+    # different (still-in-zone) price fills the remainder, moving the
+    # weighted-average entry price — liquidation_price must track it.
+    _tick(conn, bid=100.4, ask=100.5, bid_qty=0.001, ask_qty=0.001, now=NOW_EPOCH, settings=high_leverage_settings)
+    position = journal_db.get_open_positions(conn, "ETHUSDT")[0]
+    first_liq = position["liquidation_price"]
+
+    _tick(conn, bid=100.8, ask=100.9, now=NOW_EPOCH + 5, settings=high_leverage_settings)
+    grown = journal_db.get_open_positions(conn, "ETHUSDT")[0]
+    assert grown["quantity"] > position["quantity"]
+    assert grown["liquidation_price"] != first_liq
+    mmr = Decimal(str(config.PAPER_TRADING_MAINTENANCE_MARGIN_RATE))
+    expected = grown["entry_price"] * (Decimal(1) - Decimal(1) / 50 + mmr)
+    assert grown["liquidation_price"] == expected
+
+
+def test_unrealized_pnl_updates_each_tick(conn):
+    plan_id, position = _open_and_fill_long(conn, stop_loss=90.0, take_profits=[("TP1", 120.0, 100.0)])
+    _tick(conn, bid=101.0, ask=101.1, now=NOW_EPOCH + 30)
+    updated = journal_db.get_open_positions(conn, "ETHUSDT")[0]
+    expected = (Decimal("101.0") - position["entry_price"]) * position["quantity"]
+    assert updated["unrealized_pnl_usdt"] == expected
+    assert updated["unrealized_pnl_usdt"] > 0
 
 
 # ---------------------------------------------------------------------------

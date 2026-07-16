@@ -211,6 +211,12 @@ PAPER_TRADING_MAX_HOLD_SECONDS = {
     "scalping": int(os.getenv("PAPER_TRADING_MAX_HOLD_SCALPING_SECONDS", str(2 * 3600))),
     "swing": int(os.getenv("PAPER_TRADING_MAX_HOLD_SWING_SECONDS", str(24 * 3600))),
 }
+# A single flat maintenance-margin-rate approximation for paper_trading.py's
+# liquidation-price modeling — real exchanges use a notional-tiered MMR
+# table (higher position size = higher rate), which isn't available without
+# live BingX risk-limit data (same "can't confirm live exchange specifics"
+# situation as bingx_private_client.py). Reasonable for retail position sizes.
+PAPER_TRADING_MAINTENANCE_MARGIN_RATE = float(os.getenv("PAPER_TRADING_MAINTENANCE_MARGIN_RATE", "0.005"))
 
 # backtest_engine.py (Stage 9): walks historical candles through the SAME
 # feature_engine/market_regime/strategy_engine pipeline live code uses (no
