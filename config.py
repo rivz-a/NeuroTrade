@@ -51,6 +51,71 @@ FUNDING_HISTORY_LIMIT = int(os.getenv("FUNDING_HISTORY_LIMIT", "5"))
 OI_HISTORY_FILE = Path(__file__).resolve().parent / "oi_history.jsonl"
 OI_HISTORY_MAX_ENTRIES = int(os.getenv("OI_HISTORY_MAX_ENTRIES", "500"))
 
+# market_data_engine.py: a separate, quality-checked normalized snapshot
+# layer (Stage 2 of the roadmap) — independent of fetch_snapshot/market_data.py,
+# not wired into the AI pipeline yet. market_data_history.jsonl is a compact
+# top-of-book + instrument-spec log (see market_data_history.py), the same
+# append/trim pattern as oi_history.py above.
+MARKET_DATA_HISTORY_FILE = Path(__file__).resolve().parent / "market_data_history.jsonl"
+MARKET_DATA_HISTORY_MAX_ENTRIES = int(os.getenv("MARKET_DATA_HISTORY_MAX_ENTRIES", "500"))
+MARKET_DATA_TRADES_LIMIT = int(os.getenv("MARKET_DATA_TRADES_LIMIT", "20"))
+# A candle gap/staleness beyond this multiple of the timeframe's own interval
+# is treated as a hard data-quality failure (NO_TRADE), not just a warning.
+MARKET_DATA_MAX_CANDLE_GAP_MULTIPLIER = float(os.getenv("MARKET_DATA_MAX_CANDLE_GAP_MULTIPLIER", "2.0"))
+MARKET_DATA_MAX_ORDERBOOK_AGE_SECONDS = float(os.getenv("MARKET_DATA_MAX_ORDERBOOK_AGE_SECONDS", "15"))
+MARKET_DATA_MAX_SOURCE_TIME_SKEW_SECONDS = float(os.getenv("MARKET_DATA_MAX_SOURCE_TIME_SKEW_SECONDS", "60"))
+
+# feature_engine.py (Stage 3): computes trend/momentum/volatility/volume/
+# futures/orderbook features from a market_data_engine.MarketDataSnapshot.
+# Not wired into the AI pipeline yet — same standalone-first approach as
+# market_data_engine.py in Stage 2.
+FEATURE_EMA_SLOPE_LOOKBACK = int(os.getenv("FEATURE_EMA_SLOPE_LOOKBACK", "5"))
+FEATURE_RATE_OF_CHANGE_LOOKBACK = int(os.getenv("FEATURE_RATE_OF_CHANGE_LOOKBACK", "5"))
+FEATURE_ADX_PERIOD = int(os.getenv("FEATURE_ADX_PERIOD", "14"))
+FEATURE_SUPERTREND_PERIOD = int(os.getenv("FEATURE_SUPERTREND_PERIOD", "10"))
+FEATURE_SUPERTREND_MULTIPLIER = float(os.getenv("FEATURE_SUPERTREND_MULTIPLIER", "3.0"))
+FEATURE_STRUCTURE_SWING_WINDOW = int(os.getenv("FEATURE_STRUCTURE_SWING_WINDOW", "3"))
+FEATURE_ATR_PERCENTILE_LOOKBACK = int(os.getenv("FEATURE_ATR_PERCENTILE_LOOKBACK", "100"))
+FEATURE_RANGE_COMPRESSION_PERCENTILE = float(os.getenv("FEATURE_RANGE_COMPRESSION_PERCENTILE", "20"))
+FEATURE_VOLATILITY_EXPANSION_PERCENTILE = float(os.getenv("FEATURE_VOLATILITY_EXPANSION_PERCENTILE", "80"))
+FEATURE_REALIZED_VOL_WINDOW = int(os.getenv("FEATURE_REALIZED_VOL_WINDOW", "20"))
+FEATURE_VOLUME_SMA_WINDOW = int(os.getenv("FEATURE_VOLUME_SMA_WINDOW", "20"))
+FEATURE_VOLUME_SPIKE_MULTIPLIER = float(os.getenv("FEATURE_VOLUME_SPIKE_MULTIPLIER", "2.0"))
+FEATURE_VOLUME_TREND_FAST_WINDOW = int(os.getenv("FEATURE_VOLUME_TREND_FAST_WINDOW", "10"))
+FEATURE_VOLUME_TREND_SLOW_WINDOW = int(os.getenv("FEATURE_VOLUME_TREND_SLOW_WINDOW", "50"))
+FEATURE_LARGE_WALL_MULTIPLIER = float(os.getenv("FEATURE_LARGE_WALL_MULTIPLIER", "5.0"))
+FEATURE_ORDERBOOK_IMBALANCE_MIN_WINDOW_SECONDS = float(os.getenv("FEATURE_ORDERBOOK_IMBALANCE_MIN_WINDOW_SECONDS", "30"))
+FEATURE_ORDERBOOK_IMBALANCE_MAX_WINDOW_SECONDS = float(os.getenv("FEATURE_ORDERBOOK_IMBALANCE_MAX_WINDOW_SECONDS", "120"))
+
+# market_regime.py (Stage 4): classifies one of 10 market regimes per
+# timeframe from a feature_engine.FeatureSet, purely a decision tree over
+# already-computed features — no new indicator math. Not wired into the
+# AI pipeline yet.
+REGIME_ADX_TREND_THRESHOLD = float(os.getenv("REGIME_ADX_TREND_THRESHOLD", "25"))
+REGIME_ADX_RANGE_THRESHOLD = float(os.getenv("REGIME_ADX_RANGE_THRESHOLD", "18"))
+REGIME_FUNDING_EXTREME_THRESHOLD = float(os.getenv("REGIME_FUNDING_EXTREME_THRESHOLD", "0.0005"))
+
+# strategy_engine.py (Stage 5): LLM-independent LONG/SHORT/NO_TRADE
+# scoring from a feature_engine.FeatureSet + market_regime.RegimeResult,
+# via a versioned, data-driven rule list (see RULES in strategy_engine.py).
+# Not wired into the AI pipeline yet.
+STRATEGY_RULESET_VERSION = "v1"
+STRATEGY_BASELINE_SCORE = float(os.getenv("STRATEGY_BASELINE_SCORE", "50"))
+STRATEGY_TIMEFRAME_ALIGNMENT_THRESHOLD = float(os.getenv("STRATEGY_TIMEFRAME_ALIGNMENT_THRESHOLD", "0.75"))
+STRATEGY_RSI_OVERBOUGHT = float(os.getenv("STRATEGY_RSI_OVERBOUGHT", "70"))
+STRATEGY_RSI_OVERSOLD = float(os.getenv("STRATEGY_RSI_OVERSOLD", "30"))
+STRATEGY_LOW_VOLUME_RATIO = float(os.getenv("STRATEGY_LOW_VOLUME_RATIO", "0.5"))
+STRATEGY_FUNDING_EXTREME_THRESHOLD = float(os.getenv("STRATEGY_FUNDING_EXTREME_THRESHOLD", "0.0005"))
+STRATEGY_ORDERBOOK_IMBALANCE_THRESHOLD = float(os.getenv("STRATEGY_ORDERBOOK_IMBALANCE_THRESHOLD", "0.3"))
+STRATEGY_NEAR_LEVEL_ATR_THRESHOLD = float(os.getenv("STRATEGY_NEAR_LEVEL_ATR_THRESHOLD", "0.5"))
+STRATEGY_MIN_RISK_REWARD = float(os.getenv("STRATEGY_MIN_RISK_REWARD", "1.5"))
+STRATEGY_BIAS_MARGIN = float(os.getenv("STRATEGY_BIAS_MARGIN", "15"))
+STRATEGY_BIAS_MIN_SCORE = float(os.getenv("STRATEGY_BIAS_MIN_SCORE", "55"))
+STRATEGY_NO_TRADE_DOMINANT_SCORE = float(os.getenv("STRATEGY_NO_TRADE_DOMINANT_SCORE", "60"))
+STRATEGY_SCALPING_PRIMARY_TIMEFRAME = os.getenv("STRATEGY_SCALPING_PRIMARY_TIMEFRAME", "5m")
+STRATEGY_SWING_PRIMARY_TIMEFRAME = os.getenv("STRATEGY_SWING_PRIMARY_TIMEFRAME", "1h")
+STRATEGY_SWING_FUNDING_WEIGHT_MULTIPLIER = float(os.getenv("STRATEGY_SWING_FUNDING_WEIGHT_MULTIPLIER", "2.0"))
+
 # Prediction accuracy tracking (see prediction_tracker.py). Every real (ok)
 # AI verdict is logged with its trade plan; once `horizon` seconds have
 # passed since a given prediction, the next snapshot fetch walks the actual
@@ -123,6 +188,99 @@ SCHEMA_VERSION = 1
 # read if it doesn't exist yet. Not committed (per-user local state, same
 # treatment as .env/dashboard_cache.pkl).
 RISK_SETTINGS_FILE = Path(__file__).resolve().parent / "risk_settings.json"
+
+# journal_db.py: standalone SQLite journal — one durable, queryable record
+# per pipeline stage (market snapshot -> features -> strategy score -> AI
+# predictions -> consensus trade plan -> outcome), plus schema-only
+# paper/real order + position/fill tables for a future execution stage.
+# Additive/parallel to prediction_tracker.py's predictions.jsonl, not a
+# replacement (Stage 7 of the roadmap). Not wired into the live refresh
+# cycle yet — a standalone, fully-tested module first, same approach as
+# market_data_engine.py/feature_engine.py/market_regime.py/strategy_engine.py.
+JOURNAL_DB_FILE = Path(__file__).resolve().parent / "journal.db"
+JOURNAL_DB_BUSY_TIMEOUT_MS = int(os.getenv("JOURNAL_DB_BUSY_TIMEOUT_MS", "5000"))
+
+# paper_trading.py (Stage 8): live, tick-driven simulation of order fills and
+# position exits against real BingX book-ticker prices, using risk_manager's
+# fee/slippage model (not the flatter config.TRADING_COMMISSION_PCT/
+# TRADING_SLIPPAGE_PCT pair below, which stays reserved for
+# outcome_simulator.py/prediction_tracker.py). Not wired into a scheduler
+# yet — process_tick() must be called repeatedly by something external.
+PAPER_TRADING_BREAKEVEN_TRIGGER_R = float(os.getenv("PAPER_TRADING_BREAKEVEN_TRIGGER_R", "1.0"))
+PAPER_TRADING_MAX_HOLD_SECONDS = {
+    "scalping": int(os.getenv("PAPER_TRADING_MAX_HOLD_SCALPING_SECONDS", str(2 * 3600))),
+    "swing": int(os.getenv("PAPER_TRADING_MAX_HOLD_SWING_SECONDS", str(24 * 3600))),
+}
+
+# backtest_engine.py (Stage 9): walks historical candles through the SAME
+# feature_engine/market_regime/strategy_engine pipeline live code uses (no
+# separate "backtest rules") — no AI (score_strategy's decision IS the rule
+# being tested), no per-bar journal_db writes (in-memory BacktestResult
+# only). strategy_engine only produces a score/decision, not price levels
+# (those come from the AI's TradePlan live) — BACKTEST_STOP_ATR_MULTIPLIER/
+# BACKTEST_TP_LEVELS synthesize a simple, honestly-documented ATR/RR bracket
+# from the same FeatureSet just computed, standing in for what the AI would
+# have proposed. Execution economics (trailing trigger, max hold) reuse the
+# PAPER_TRADING_* constants above for consistency, not separate values.
+BACKTEST_STOP_ATR_MULTIPLIER = float(os.getenv("BACKTEST_STOP_ATR_MULTIPLIER", "1.5"))
+# Each entry: (multiple of RiskSettings.min_risk_reward, close_percent) for one partial take-profit target.
+# risk_manager.PositionCalculator requires at least ONE individual take-profit
+# (not just the blended average) to clear min_risk_reward net of fees, or the
+# scenario is rejected as FEES_TOO_HIGH — a 50/50 split at (1.0x, 2.0x) fails
+# this per-target check (each target's net RR is diluted by its own
+# close_percent), even though the blended RR clears the floor comfortably.
+# (1.5x/40%, 3.0x/60%) reliably satisfies the per-target gate via TP2.
+BACKTEST_TP_LEVELS = ((1.5, 40.0), (3.0, 60.0))
+BACKTEST_KLINE_PAGE_LIMIT = int(os.getenv("BACKTEST_KLINE_PAGE_LIMIT", "1000"))
+
+# model_weights.py (Stage 10): dynamic per-model vote weighting, derived
+# from prediction_tracker.py's predictions.jsonl — the only existing
+# source with a genuine, independently-scored outcome per model, not just
+# the consensus winner (journal.db's trade_outcomes is 1:1 with the single
+# consensus-selected plan per signal, not per model). Standalone module —
+# not wired into consensus_engine.py's live voting this stage.
+MODEL_WEIGHT_MIN_SAMPLE = int(os.getenv("MODEL_WEIGHT_MIN_SAMPLE", "10"))
+MODEL_WEIGHT_FULL_SAMPLE = int(os.getenv("MODEL_WEIGHT_FULL_SAMPLE", "30"))
+MODEL_WEIGHT_NEUTRAL = float(os.getenv("MODEL_WEIGHT_NEUTRAL", "0.5"))
+MODEL_WEIGHT_MIN = float(os.getenv("MODEL_WEIGHT_MIN", "0.1"))
+MODEL_WEIGHT_MAX = float(os.getenv("MODEL_WEIGHT_MAX", "1.0"))
+MODEL_WEIGHT_EXPECTANCY_SCALE = float(os.getenv("MODEL_WEIGHT_EXPECTANCY_SCALE", "0.25"))
+# (upper_bound_inclusive, label) — confidence 0..100 mapped to a bucket.
+CONFIDENCE_BUCKETS = ((59, "LOW"), (74, "MEDIUM"), (89, "HIGH"), (100, "VERY_HIGH"))
+
+# bingx_private_client.py / execution_engine.py (Stage 11): the FIRST code
+# in this app able to place REAL orders with REAL money.
+#
+# BINGX_API_KEY/BINGX_API_SECRET MUST belong to an API key that is
+# TRADING-ONLY (no withdrawal permission) and IP-whitelisted to this
+# machine — both are BingX-ACCOUNT-level settings configured on BingX's
+# own website; this code cannot enforce or verify either one. Do this
+# BEFORE ever setting EXECUTION_DRY_RUN=false.
+#
+# Endpoint paths/params below are best-effort from public docs/SDKs
+# (BingX's own docs are a JS-rendered site this tooling couldn't fully
+# verify) — EXECUTION_DRY_RUN defaults to true specifically so every
+# request can be built, signed, and inspected before it's ever sent.
+BINGX_API_KEY = os.getenv("BINGX_API_KEY", "").strip()
+BINGX_API_SECRET = os.getenv("BINGX_API_SECRET", "").strip()
+BINGX_PRIVATE_RECV_WINDOW_MS = int(os.getenv("BINGX_PRIVATE_RECV_WINDOW_MS", "5000"))
+EXECUTION_DRY_RUN = os.getenv("EXECUTION_DRY_RUN", "true").strip().lower() != "false"
+
+EXECUTION_KILL_SWITCH_FILE = Path(__file__).resolve().parent / "kill_switch.flag"
+EXECUTION_MAX_TRADES_PER_DAY = int(os.getenv("EXECUTION_MAX_TRADES_PER_DAY", "5"))
+EXECUTION_DAILY_LOSS_LIMIT_USDT = float(os.getenv("EXECUTION_DAILY_LOSS_LIMIT_USDT", "10"))
+EXECUTION_COOLDOWN_AFTER_STOP_SECONDS = int(os.getenv("EXECUTION_COOLDOWN_AFTER_STOP_SECONDS", str(30 * 60)))
+# Mirrors consensus_engine._PRICE_ZONE_TOLERANCE_FRACTION — same rationale
+# (absorb quote noise/rounding at the price re-check, not a real tolerance
+# for chasing price), reproduced here rather than imported since the two
+# modules are meant to stay independently testable.
+EXECUTION_PRICE_ZONE_TOLERANCE_FRACTION = 0.0005
+
+# position_manager.py (Stage 12): once 2+ take-profit levels have filled,
+# manage_stop_loss switches from a single breakeven jump to a real trailing
+# stop that ratchets toward the current price, staying this many multiples
+# of the position's original risk (R) behind it.
+EXECUTION_TRAILING_STOP_R_MULTIPLE = float(os.getenv("EXECUTION_TRAILING_STOP_R_MULTIPLE", "1.0"))
 
 
 @dataclass(frozen=True)

@@ -54,27 +54,30 @@ class TakeProfit(BaseModel):
     close_percent: float = Field(ge=0, le=100)
 
 
-class RiskReward(BaseModel):
-    tp1: float | None = None
-    tp2: float | None = None
-    tp3: float | None = None
-
-
 class TradePlan(BaseModel):
     signal: Signal
     entry_status: EntryStatus
     confidence: int = Field(ge=0, le=100)
+    # The model's own read AFTER being shown the programmatically computed
+    # regime (see report_builder.AIContext) — a cross-check, not a guess
+    # from scratch. A mismatch belongs in `contradictions`, not a silent
+    # overwrite of our own answer.
     market_regime: MarketRegime
     entry: EntryZone
     stop_loss: float
     take_profits: list[TakeProfit] = Field(default_factory=list)
-    risk_reward: RiskReward = Field(default_factory=RiskReward)
     time_horizon_minutes: int
     valid_for_minutes: int = Field(gt=0)
     reasons: list[str] = Field(default_factory=list)
     risks: list[str] = Field(default_factory=list)
     invalidation_conditions: list[str] = Field(default_factory=list)
     wait_conditions: list[str] = Field(default_factory=list)
+    # Stage 6: the model's new interpretive role — flag disagreements with
+    # the given regime/scores/features, and note any context it thinks is
+    # missing (stale data, no funding, thin order book, ...). Both default
+    # to empty, same convention as reasons/risks above.
+    contradictions: list[str] = Field(default_factory=list)
+    missing_context: list[str] = Field(default_factory=list)
     summary: str = ""
 
 

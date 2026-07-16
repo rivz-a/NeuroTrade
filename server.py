@@ -33,6 +33,7 @@ import bingx_client
 import config
 import position_service
 import prediction_tracker
+import report_builder
 import risk_settings_store
 from ai_client import AIAnalysisResult
 from dashboard_builder import build_dashboard
@@ -90,10 +91,11 @@ def _refresh_mode(state: _State, mode: str) -> None:
     tab" requirement.
     """
     snapshot = fetch_snapshot(state.symbol, log=print)
-    report_text = build_report({**snapshot, "mode_key": mode})
+    bingx_symbol = config.to_bingx_symbol(snapshot["symbol"])
+    ai_context = report_builder.build_ai_context(bingx_symbol, mode)
+    report_text = build_report({**snapshot, "mode_key": mode}, ai_context)
     ctx = build_validation_context(snapshot, mode)
     results = ai_client.analyze_with_all(report_text, config.AI_MODELS, config.AI_REQUEST_TIMEOUT, ctx, mode)
-    bingx_symbol = config.to_bingx_symbol(snapshot["symbol"])
     prediction_tracker.record_results(mode, results, snapshot["current_price"], bingx_symbol)
 
     with state.lock:
@@ -117,10 +119,11 @@ def _refresh_single(state: _State, mode: str, label: str) -> None:
         raise ValueError(f"Неизвестная модель: {label}")
 
     snapshot = fetch_snapshot(state.symbol, log=print)
-    report_text = build_report({**snapshot, "mode_key": mode})
+    bingx_symbol = config.to_bingx_symbol(snapshot["symbol"])
+    ai_context = report_builder.build_ai_context(bingx_symbol, mode)
+    report_text = build_report({**snapshot, "mode_key": mode}, ai_context)
     ctx = build_validation_context(snapshot, mode)
     result = ai_client.analyze_single(report_text, cfg, config.AI_REQUEST_TIMEOUT, ctx, mode)
-    bingx_symbol = config.to_bingx_symbol(snapshot["symbol"])
     prediction_tracker.record_results(mode, [result], snapshot["current_price"], bingx_symbol)
 
     with state.lock:
@@ -507,8 +510,10 @@ def run_server(
     else:
         say("[cyan]Кеша нет — первичная загрузка данных для сервера (оба режима)...[/cyan]")
         snapshot = fetch_snapshot(symbol, log=lambda m: say(f"[cyan]{m}[/cyan]"))
+        bingx_symbol = config.to_bingx_symbol(snapshot["symbol"])
         report_texts = {
-            mode: build_report({**snapshot, "mode_key": mode}) for mode in ("scalping", "swing")
+            mode: build_report({**snapshot, "mode_key": mode}, report_builder.build_ai_context(bingx_symbol, mode))
+            for mode in ("scalping", "swing")
         }
         validation_contexts = {
             mode: build_validation_context(snapshot, mode) for mode in ("scalping", "swing")
@@ -516,7 +521,6 @@ def run_server(
         results_by_mode = ai_client.analyze_modes(
             report_texts, config.AI_MODELS, config.AI_REQUEST_TIMEOUT, validation_contexts
         )
-        bingx_symbol = config.to_bingx_symbol(snapshot["symbol"])
         for mode, results in results_by_mode.items():
             prediction_tracker.record_results(mode, results, snapshot["current_price"], bingx_symbol)
         state.snapshot = snapshot

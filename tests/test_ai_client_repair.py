@@ -21,7 +21,6 @@ VALID_JSON_TEXT = """
   "entry": {"type": "LIMIT_ZONE", "from": 1776.80, "to": 1777.20, "trigger": "x"},
   "stop_loss": 1774.80,
   "take_profits": [{"label": "TP1", "price": 1779.20, "close_percent": 100}],
-  "risk_reward": {"tp1": 1.2},
   "time_horizon_minutes": 30,
   "valid_for_minutes": 15,
   "reasons": ["r"],

@@ -182,7 +182,7 @@ def test_gross_ok_net_fails_gives_fees_too_high():
 def test_below_minimum_order():
     settings = _settings(account_balance_usdt=Decimal("10"), risk_percent=Decimal("0.01"), minimum_order_notional_usdt=Decimal("5"))
     result = PositionCalculator(settings).calculate(_scenario())
-    assert result.status == PositionStatus.BELOW_MINIMUM_ORDER
+    assert result.status == PositionStatus.POSITION_TOO_SMALL
 
 
 # 9. Неверный stop loss для LONG (стоп выше входа).
@@ -224,7 +224,7 @@ def test_risk_over_100_end_to_end():
 # 14. Риск равен нулю.
 def test_risk_zero_end_to_end():
     result = PositionCalculator(_settings(risk_percent=Decimal("0"))).calculate(_scenario())
-    assert result.status == PositionStatus.BELOW_MINIMUM_ORDER
+    assert result.status == PositionStatus.POSITION_TOO_SMALL
     assert result.position_size_coin_rounded == Decimal("0")
 
 
@@ -241,7 +241,7 @@ def test_very_wide_stop_falls_below_minimum():
     scenario = _scenario(entry_from=Decimal("100"), entry_to=Decimal("100"), stop_loss=Decimal("50"))
     settings = _settings(account_balance_usdt=Decimal("50"), risk_percent=Decimal("1"))
     result = PositionCalculator(settings).calculate(scenario)
-    assert result.status == PositionStatus.BELOW_MINIMUM_ORDER
+    assert result.status == PositionStatus.POSITION_TOO_SMALL
 
 
 # 17. Округление количества вниз.
@@ -324,3 +324,114 @@ def test_negative_net_profit_after_fees():
     )
     result = PositionCalculator(settings).calculate(scenario)
     assert result.take_profit_results[0].net_profit_usdt < 0
+
+
+# --- Этап 1.1: blended-результат при частичном закрытии (TP1/TP2/TP3) ---
+
+
+# 26. Три цели 50/30/20% — blended это точная сумма трёх TakeProfitResult.
+def test_blended_result_three_targets_sums_to_hundred():
+    scenario = _scenario(
+        take_profits=[
+            TakeProfitTarget("TP1", Decimal("102"), Decimal("50")),
+            TakeProfitTarget("TP2", Decimal("104"), Decimal("30")),
+            TakeProfitTarget("TP3", Decimal("106"), Decimal("20")),
+        ]
+    )
+    settings = _settings(max_margin_percent=Decimal("100"), leverage=20, min_risk_reward=Decimal("0.5"))
+    result = PositionCalculator(settings).calculate(scenario)
+    tp1, tp2, tp3 = result.take_profit_results
+    blended = result.blended
+    assert blended is not None
+    assert blended.total_close_percent == Decimal("100")
+    assert blended.gross_profit_usdt == tp1.gross_profit_usdt + tp2.gross_profit_usdt + tp3.gross_profit_usdt
+    assert blended.net_profit_usdt == tp1.net_profit_usdt + tp2.net_profit_usdt + tp3.net_profit_usdt
+    assert blended.fees_usdt == tp1.fees_usdt + tp2.fees_usdt + tp3.fees_usdt
+    price_loss = result.position_size_coin_rounded * result.stop_distance
+    assert blended.gross_rr == blended.gross_profit_usdt / price_loss
+    assert blended.net_rr == blended.net_profit_usdt / result.total_expected_loss_usdt
+    assert not any("close_percent" in w for w in result.warnings)
+
+
+# 27. Две цели 60/40% — сумма ровно 100%, предупреждения о расхождении нет.
+def test_blended_result_two_targets_no_coverage_warning():
+    scenario = _scenario(
+        take_profits=[
+            TakeProfitTarget("TP1", Decimal("103"), Decimal("60")),
+            TakeProfitTarget("TP2", Decimal("106"), Decimal("40")),
+        ]
+    )
+    result = PositionCalculator(_settings()).calculate(scenario)
+    assert result.blended is not None
+    assert result.blended.total_close_percent == Decimal("100")
+    assert not any("%" in w and "остаток" in w for w in result.warnings)
+    assert not any("некорректно" in w for w in result.warnings)
+
+
+# 28. Одна цель 100% — blended численно совпадает с единственным TakeProfitResult.
+def test_blended_result_single_target_mirrors_the_one_result():
+    result = PositionCalculator(_settings()).calculate(_scenario())
+    tp1 = result.take_profit_results[0]
+    blended = result.blended
+    assert blended is not None
+    assert blended.total_close_percent == Decimal("100")
+    assert blended.gross_profit_usdt == tp1.gross_profit_usdt
+    assert blended.net_profit_usdt == tp1.net_profit_usdt
+    assert blended.net_rr == tp1.net_rr
+
+
+# 29. Две цели, сумма 99.4% — validate_scenario_and_settings принимает любую
+# сумму в диапазоне 99-101% (risk_manager.py:294-297), но наш допуск на
+# точное совпадение с 100% для blended-предупреждения строже (0.5%), так что
+# этот легитимный, прошедший валидацию план всё равно получает свою пометку.
+def test_blended_result_undercovered_but_valid_plan_warns():
+    scenario = _scenario(
+        take_profits=[
+            TakeProfitTarget("TP1", Decimal("102"), Decimal("50")),
+            TakeProfitTarget("TP2", Decimal("104"), Decimal("49.4")),
+        ]
+    )
+    result = PositionCalculator(_settings()).calculate(scenario)
+    assert result.status not in (PositionStatus.INVALID_SCENARIO, PositionStatus.INVALID_SETTINGS)
+    assert result.blended is not None
+    assert result.blended.total_close_percent == Decimal("99.4")
+    assert any("99.4" in w and "остаток" in w for w in result.warnings)
+
+
+# 30. Две цели, сумма 100.6% — тоже внутри допустимого для валидации диапазона
+# (99-101%), но выходит за 0.5%-порог blended-предупреждения о превышении.
+def test_blended_result_overcovered_but_valid_plan_warns():
+    scenario = _scenario(
+        take_profits=[
+            TakeProfitTarget("TP1", Decimal("102"), Decimal("50")),
+            TakeProfitTarget("TP2", Decimal("104"), Decimal("50.6")),
+        ]
+    )
+    result = PositionCalculator(_settings()).calculate(scenario)
+    assert result.status not in (PositionStatus.INVALID_SCENARIO, PositionStatus.INVALID_SETTINGS)
+    assert result.blended is not None
+    assert result.blended.total_close_percent == Decimal("100.6")
+    assert any("100.6" in w and "больше 100%" in w for w in result.warnings)
+
+
+# 30b. Сумма явно за пределами 99-101% (например 80%) отклоняется ещё на
+# уровне validate_scenario_and_settings — до нашего кода blended вообще не
+# доходит, calculate() возвращает пустой результат с issues, а не warnings.
+def test_grossly_invalid_close_percent_sum_rejected_before_blended():
+    scenario = _scenario(
+        take_profits=[
+            TakeProfitTarget("TP1", Decimal("102"), Decimal("50")),
+            TakeProfitTarget("TP2", Decimal("104"), Decimal("30")),
+        ]
+    )
+    result = PositionCalculator(_settings()).calculate(scenario)
+    assert result.status == PositionStatus.INVALID_SCENARIO
+    assert result.blended is None
+    assert any("close_percent" in i and "100%" in i for i in result.issues)
+
+
+# 31. Невалидный сценарий (нет take_profits) — blended отсутствует.
+def test_blended_result_is_none_without_take_profits():
+    scenario = _scenario(take_profits=[])
+    result = PositionCalculator(_settings()).calculate(scenario)
+    assert result.blended is None

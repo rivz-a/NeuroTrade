@@ -46,6 +46,7 @@ import ai_client
 import bingx_client
 import config
 import prediction_tracker
+import report_builder
 from dashboard_builder import build_dashboard
 from market_data import fetch_snapshot
 from report_builder import MODE_LABELS, build_report
@@ -138,7 +139,9 @@ def main() -> int:
         console.print(f"[bold red]BingX API недоступен: {exc}[/bold red]")
         return 1
 
-    report_text = build_report({**snapshot, "mode_key": args.mode})
+    bingx_symbol = config.to_bingx_symbol(snapshot["symbol"])
+    ai_context = report_builder.build_ai_context(bingx_symbol, args.mode)
+    report_text = build_report({**snapshot, "mode_key": args.mode}, ai_context)
 
     console.rule("[bold green]Market Snapshot")
     console.print(report_text)
@@ -179,7 +182,9 @@ def main() -> int:
     # task text at the end differs) and query every model for both in one
     # parallel batch, so this doesn't take 2x as long as a single mode.
     report_texts = {
-        mode: report_text if mode == args.mode else build_report({**snapshot, "mode_key": mode})
+        mode: report_text
+        if mode == args.mode
+        else build_report({**snapshot, "mode_key": mode}, report_builder.build_ai_context(bingx_symbol, mode))
         for mode in ("scalping", "swing")
     }
     validation_contexts = {mode: build_validation_context(snapshot, mode) for mode in ("scalping", "swing")}

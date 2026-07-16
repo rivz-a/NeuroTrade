@@ -51,7 +51,7 @@ class PositionStatus(str, Enum):
     PRICE_OUTSIDE_ENTRY_ZONE = "PRICE_OUTSIDE_ENTRY_ZONE"
     RISK_LIMIT = "RISK_LIMIT"
     MARGIN_LIMIT = "MARGIN_LIMIT"
-    BELOW_MINIMUM_ORDER = "BELOW_MINIMUM_ORDER"
+    POSITION_TOO_SMALL = "POSITION_TOO_SMALL"
     LOW_RISK_REWARD = "LOW_RISK_REWARD"
     FEES_TOO_HIGH = "FEES_TOO_HIGH"
     MISSING_MARKET_RULES = "MISSING_MARKET_RULES"
@@ -68,7 +68,7 @@ STATUS_MESSAGES: dict[PositionStatus, str] = {
     PositionStatus.PRICE_OUTSIDE_ENTRY_ZONE: "Текущая цена вышла из расчётной зоны входа.",
     PositionStatus.RISK_LIMIT: "Размер позиции ограничен допустимым риском на сделку.",
     PositionStatus.MARGIN_LIMIT: "Размер позиции ограничен максимальной разрешённой маржой.",
-    PositionStatus.BELOW_MINIMUM_ORDER: (
+    PositionStatus.POSITION_TOO_SMALL: (
         "Рассчитанный размер позиции меньше минимального размера ордера BingX. "
         "Не повышайте риск автоматически."
     ),
@@ -351,11 +351,29 @@ def round_to_step(value: Decimal, step: Decimal) -> Decimal:
 class TakeProfitResult:
     label: str
     price: Decimal
+    close_percent: Decimal
     distance: Decimal
     distance_percent: Decimal
     gross_profit_usdt: Decimal
     fees_usdt: Decimal
     net_profit_usdt: Decimal
+    gross_rr: Decimal
+    net_rr: Decimal | None
+
+
+@dataclass(frozen=True)
+class BlendedExitResult:
+    """Aggregate outcome across the whole exit plan, assuming every target
+    fills for its stated `close_percent` share of the position — "if TP1
+    closes its slice, then TP2 closes its slice, ..., how much did the
+    trade make in total and what's the combined net R:R". Distinct from
+    each `TakeProfitResult`, which only describes one target in isolation.
+    """
+
+    total_close_percent: Decimal
+    gross_profit_usdt: Decimal
+    net_profit_usdt: Decimal
+    fees_usdt: Decimal
     gross_rr: Decimal
     net_rr: Decimal | None
 
@@ -387,6 +405,7 @@ class PositionCalculation:
     actual_risk_percent: Decimal
     take_profit_results: list[TakeProfitResult]
     primary_target_label: str | None
+    blended: BlendedExitResult | None
     free_balance_after_open_usdt: Decimal
     bingx_fields: dict[str, Decimal]
     warnings: list[str]
@@ -431,6 +450,7 @@ def _blank_calculation(status: PositionStatus, issues: list[str], scenario: Trad
         actual_risk_percent=_ZERO,
         take_profit_results=[],
         primary_target_label=None,
+        blended=None,
         free_balance_after_open_usdt=_ZERO,
         bingx_fields={},
         warnings=[],
@@ -531,7 +551,7 @@ class PositionCalculator:
             or position_notional_usdt < settings.minimum_order_notional_usdt
             or position_size_coin_rounded < settings.minimum_quantity
         ):
-            status = PositionStatus.BELOW_MINIMUM_ORDER
+            status = PositionStatus.POSITION_TOO_SMALL
             issues.append(STATUS_MESSAGES[status])
 
         take_profit_results: list[TakeProfitResult] = []
@@ -560,6 +580,7 @@ class PositionCalculator:
                 TakeProfitResult(
                     label=tp.label,
                     price=tp.price,
+                    close_percent=tp.close_percent,
                     distance=distance,
                     distance_percent=distance_percent,
                     gross_profit_usdt=gross_profit_usdt,
@@ -569,6 +590,35 @@ class PositionCalculator:
                     net_rr=net_rr,
                 )
             )
+
+        blended: BlendedExitResult | None = None
+        if take_profit_results:
+            total_close_percent = sum((tp.close_percent for tp in take_profit_results), _ZERO)
+            blended_gross_profit_usdt = sum((tp.gross_profit_usdt for tp in take_profit_results), _ZERO)
+            blended_net_profit_usdt = sum((tp.net_profit_usdt for tp in take_profit_results), _ZERO)
+            blended_fees_usdt = sum((tp.fees_usdt for tp in take_profit_results), _ZERO)
+            blended_gross_rr = (blended_gross_profit_usdt / price_loss) if price_loss > 0 else _ZERO
+            blended_net_rr = (
+                (blended_net_profit_usdt / total_expected_loss_usdt) if total_expected_loss_usdt > 0 else None
+            )
+            blended = BlendedExitResult(
+                total_close_percent=total_close_percent,
+                gross_profit_usdt=blended_gross_profit_usdt,
+                net_profit_usdt=blended_net_profit_usdt,
+                fees_usdt=blended_fees_usdt,
+                gross_rr=blended_gross_rr,
+                net_rr=blended_net_rr,
+            )
+            if abs(total_close_percent - Decimal("100")) > Decimal("0.5"):
+                if total_close_percent > Decimal("100"):
+                    warnings.append(
+                        f"Сумма close_percent целей равна {total_close_percent}%, больше 100% — "
+                        "план закрытия задан некорректно."
+                    )
+                else:
+                    warnings.append(
+                        f"План закрытия покрывает только {total_close_percent}% позиции — остаток без цели."
+                    )
 
         if status == PositionStatus.VALID and take_profit_results:
             if primary_target_label is None:
@@ -615,6 +665,7 @@ class PositionCalculator:
             actual_risk_percent=actual_risk_percent,
             take_profit_results=take_profit_results,
             primary_target_label=primary_target_label,
+            blended=blended,
             free_balance_after_open_usdt=free_balance_after_open_usdt,
             bingx_fields=bingx_fields,
             warnings=warnings,

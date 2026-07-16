@@ -9,4 +9,10 @@ dashboard_cache.pkl
 oi_history.jsonl
 predictions.jsonl
 risk_settings.json
+market_data_history.jsonl
+journal.db
+journal.db-wal
+journal.db-shm
+journal.db-journal
+kill_switch.flag
 *.log

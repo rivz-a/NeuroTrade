@@ -5,7 +5,7 @@ sanity checks (in ATR multiples), R:R vs the mode's minimum floor, and WAIT's
 "must carry conditions" requirement.
 """
 
-from ai_schema import EntryZone, RiskReward, TakeProfit, TradePlan
+from ai_schema import EntryZone, TakeProfit, TradePlan
 from trade_validator import ValidationContext, validate_trade_plan
 
 
@@ -22,7 +22,6 @@ def _base_plan(**overrides) -> TradePlan:
             TakeProfit(label="TP2", price=1781.00, close_percent=35),
             TakeProfit(label="TP3", price=1785.00, close_percent=25),
         ],
-        risk_reward=RiskReward(tp1=1.2, tp2=2.1, tp3=4.1),
         time_horizon_minutes=30,
         valid_for_minutes=15,
         reasons=["r"],
@@ -104,7 +103,6 @@ def test_entry_too_far_warns():
 def test_rr_below_mode_floor_rejected():
     plan = _base_plan(
         take_profits=[TakeProfit(label="TP1", price=1778.0, close_percent=100)],
-        risk_reward=RiskReward(tp1=0.5),
     )
     result = validate_trade_plan(plan, "swing", _ctx())
     assert result.status == "rejected"
@@ -120,5 +118,14 @@ def test_wait_without_conditions_rejected():
 
 def test_wait_with_conditions_valid():
     plan = _base_plan(signal="WAIT", wait_conditions=["Закрепление выше 1780"])
+    result = validate_trade_plan(plan, "scalping", _ctx())
+    assert result.status == "valid"
+
+
+def test_contradictions_and_missing_context_do_not_affect_validity():
+    plan = _base_plan(
+        contradictions=["Модель считает режим RANGE, хотя передан TREND_UP"],
+        missing_context=["Не хватает данных по ликвидациям"],
+    )
     result = validate_trade_plan(plan, "scalping", _ctx())
     assert result.status == "valid"

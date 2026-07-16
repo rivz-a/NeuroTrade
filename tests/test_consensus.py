@@ -5,7 +5,7 @@ trade_permission (separate from direction consensus and from plan validity).
 """
 
 from ai_client import AIAnalysisResult
-from ai_schema import EntryZone, RiskReward, TakeProfit, TradePlan
+from ai_schema import EntryZone, TakeProfit, TradePlan
 from consensus_engine import _compute_trade_permission, compute_consensus
 from trade_validator import ValidationResult
 
@@ -21,6 +21,8 @@ def _plan(
     tp1=105.0,
     valid_for_minutes=30,
     entry_status="ENTER_NOW",
+    contradictions=None,
+    missing_context=None,
 ) -> TradePlan:
     return TradePlan(
         signal=signal,
@@ -30,13 +32,14 @@ def _plan(
         entry=EntryZone(type="LIMIT_ZONE", from_=entry_from, to=entry_to, trigger="x"),
         stop_loss=stop_loss,
         take_profits=[TakeProfit(label="TP1", price=tp1, close_percent=100)],
-        risk_reward=RiskReward(tp1=2.0),
         time_horizon_minutes=30,
         valid_for_minutes=valid_for_minutes,
         reasons=["r"],
         risks=["k"],
         invalidation_conditions=["c"],
         wait_conditions=[],
+        contradictions=contradictions or [],
+        missing_context=missing_context or [],
         summary="s",
     )
 
@@ -231,3 +234,22 @@ def test_compute_trade_permission_invalid_plan_when_no_candidate():
     permission, reason = _compute_trade_permission("LONG", None, 100.0)
     assert permission == "INVALID_PLAN"
     assert reason
+
+
+def test_plan_with_contradictions_and_missing_context_still_wins_consensus():
+    # contradictions/missing_context are advisory-only text fields (not yet
+    # surfaced on SelectedPlan/the dashboard — out of scope for this stage);
+    # this only guards that carrying them on a TradePlan doesn't change
+    # voting/selection behaviour versus an otherwise-identical plan.
+    plan_a = _plan(
+        "LONG",
+        contradictions=["Модель видит RANGE, хотя передан TREND_UP"],
+        missing_context=["Нет данных по ликвидациям"],
+    )
+    plan_b = _plan("LONG")
+    votes = [_ok_result("A", plan_a), _ok_result("B", plan_b)]
+    result = compute_consensus(votes, "scalping", total_models=3, now=NOW)
+    assert result.overall_signal == "LONG"
+    assert result.state == "moderate"
+    assert result.plan is not None
+    assert result.plan.source_label in ("A", "B")

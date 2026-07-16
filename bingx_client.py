@@ -136,13 +136,17 @@ def get_klines_range(symbol: str, interval: str, start_ms: int, end_ms: int, lim
     return _parse_klines(data, symbol, interval)
 
 
-def get_orderbook(symbol: str, depth: int) -> dict[str, list[list[float]]]:
+def get_orderbook(symbol: str, depth: int) -> dict[str, list[list[float]] | int | None]:
     data = _get("/openApi/swap/v2/quote/depth", {"symbol": symbol, "limit": depth})
     bids = data.get("bids", []) if isinstance(data, dict) else []
     asks = data.get("asks", []) if isinstance(data, dict) else []
     parsed_bids = [[float(p), float(q)] for p, q in bids]
     parsed_asks = [[float(p), float(q)] for p, q in asks]
-    return {"bids": parsed_bids, "asks": parsed_asks}
+    raw_time = data.get("T") if isinstance(data, dict) else None
+    # Exchange-side timestamp (ms) for this depth snapshot — additive; existing
+    # callers only read "bids"/"asks" so this doesn't change their behavior.
+    timestamp_ms = int(raw_time) if raw_time is not None else None
+    return {"bids": parsed_bids, "asks": parsed_asks, "timestamp_ms": timestamp_ms}
 
 
 def get_funding_rate(symbol: str) -> float | None:
@@ -206,6 +210,59 @@ def get_ticker_24h(symbol: str) -> dict[str, float] | None:
         }
     except (TypeError, ValueError):
         return None
+
+
+def get_book_ticker(symbol: str) -> dict[str, float] | None:
+    """Best bid/ask right now — the actual two-sided quote, distinct from
+    `get_price` (a single last/mark price with no size or spread info).
+    """
+    try:
+        data = _get("/openApi/swap/v2/quote/bookTicker", {"symbol": symbol})
+    except (NoDataError, APIError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    ticker = data.get("book_ticker")
+    if not isinstance(ticker, dict):
+        return None
+    try:
+        return {
+            "bid_price": float(ticker["bid_price"]),
+            "bid_qty": float(ticker["bid_qty"]),
+            "ask_price": float(ticker["ask_price"]),
+            "ask_qty": float(ticker["ask_qty"]),
+            "time": int(ticker["time"]),
+        }
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def get_recent_trades(symbol: str, limit: int = 20) -> list[dict]:
+    """Most recent executed trades — a REST poll of the trade tape, not a
+    push/websocket stream (BingX's public REST API doesn't need one for
+    this; a websocket would only matter for true tick-by-tick capture).
+    """
+    try:
+        data = _get("/openApi/swap/v2/quote/trades", {"symbol": symbol, "limit": limit})
+    except (NoDataError, APIError):
+        return []
+    if not isinstance(data, list):
+        return []
+    trades: list[dict] = []
+    for item in data:
+        try:
+            trades.append(
+                {
+                    "price": float(item["price"]),
+                    "qty": float(item["qty"]),
+                    "time": int(item["time"]),
+                    "is_buyer_maker": bool(item["isBuyerMaker"]),
+                }
+            )
+        except (KeyError, TypeError, ValueError):
+            continue
+    trades.sort(key=lambda t: t["time"])
+    return trades
 
 
 def get_instrument_rules(symbol: str) -> dict[str, Decimal] | None:

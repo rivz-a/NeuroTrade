@@ -177,6 +177,13 @@ def calculate_active_position(
         display_status, display_message = "TP_ALREADY_REACHED", _DISPLAY_MESSAGES["TP_ALREADY_REACHED"]
     elif consensus.trade_permission != "ALLOWED":
         display_status, display_message = consensus.trade_permission, consensus.trade_permission_reason
+    elif calculation.status == PositionStatus.VALID and calculation.limited_by == "MARGIN":
+        # RISK-limited is the normal case (size is always sized by either
+        # risk-budget or margin — see PositionCalculator.calculate) so it
+        # stays plain VALID; MARGIN-limited is the notable exception worth
+        # a distinct badge — margin/leverage capped the size below what the
+        # risk budget alone would have allowed.
+        display_status, display_message = "MARGIN_LIMIT", STATUS_MESSAGES[PositionStatus.MARGIN_LIMIT]
     else:
         display_status = calculation.status.value
         display_message = STATUS_MESSAGES.get(calculation.status, "")

@@ -6,9 +6,19 @@ It does not call any network or trading API.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import datetime, timezone
 
 import config
+import feature_engine
+import market_data_engine
+import market_regime
+import risk_settings_store
+import strategy_engine
+from feature_engine import FeatureSet
+from market_regime import RegimeResult
+from risk_manager import RiskSettings
+from strategy_engine import ScoreResult
 
 NA = "н/д"
 
@@ -27,9 +37,10 @@ _TASK_TEXTS = {
         "позицию от нескольких часов до суток, а не минуты — это НЕ скальпинг). Дай сигнал "
         "LONG / SHORT / WAIT, уровень входа, stop loss (размещай его за структурными уровнями "
         "15m/1h — EMA20/EMA50, локальные экстремумы, а не в паре долларов от входа), take profit "
-        "1/2/3 на более удалённых уровнях поддержки/сопротивления так, чтобы итоговое соотношение "
-        "риск/прибыль было не хуже 1:1.5 (если ближайшие цели дают хуже — прямо скажи об этом и "
-        "предложи более дальнюю цель или сигнал WAIT), вероятность сценария и риски."
+        "1/2/3 на более удалённых уровнях поддержки/сопротивления. Минимально приемлемый R:R задан "
+        "ниже в разделе риск-ограничений — сам его не пересчитывай, но если по факту предлагаемых "
+        "тобой уровней он ниже заданного порога, прямо скажи об этом и предложи более дальнюю цель "
+        "или сигнал WAIT — не подгоняй числа целей, чтобы формально пройти порог."
     ),
 }
 
@@ -99,6 +110,127 @@ def _orderbook_imbalance(orderbook: dict) -> str:
     )
 
 
+@dataclass(frozen=True)
+class AIContext:
+    """Everything Stage 6 adds to the prompt beyond the existing report —
+    already-computed interpretation (regime, scores, derived features) and
+    the risk restrictions the model must treat as fixed, not recompute.
+    """
+
+    regime: RegimeResult
+    score: ScoreResult
+    features: FeatureSet
+    risk_settings: RiskSettings
+
+
+def build_ai_context(symbol: str, mode: str) -> AIContext | None:
+    """Best-effort: `None` on ANY failure (network, insufficient candle
+    history, anything) so a problem in this second, independent pipeline
+    never blocks the existing, working `fetch_snapshot`-based report — the
+    caller just omits the new section and the report is exactly what it
+    was before this stage. Runs a SECOND, separate round of BingX calls
+    from `fetch_snapshot`'s own (via `market_data_engine.collect_snapshot`)
+    — a known, accepted duplication for this iteration; merging the two
+    data pipelines is a separate, later cleanup.
+    """
+    try:
+        snapshot = market_data_engine.collect_snapshot(symbol)
+        features = feature_engine.compute_features(snapshot)
+        regime = market_regime.classify_regime(features)
+        score = strategy_engine.score_strategy(features, regime, mode=mode)
+        settings = risk_settings_store.load()
+        return AIContext(regime=regime, score=score, features=features, risk_settings=settings)
+    except Exception:
+        return None
+
+
+def _ai_context_section(ctx: AIContext) -> list[str]:
+    lines = [
+        "=== Программный анализ (Market Regime / Strategy Score Engine) ===",
+        "Это уже посчитанная кодом интерпретация — используй как контекст, не пересчитывай.",
+        "",
+        f"Режим рынка (определён кодом): {ctx.regime.regime}",
+        f"Рекомендация по режиму: {ctx.regime.strategy_hint}",
+    ]
+    if ctx.regime.regime_by_timeframe:
+        tf_regimes = ", ".join(f"{tf}={r}" for tf, r in ctx.regime.regime_by_timeframe.items())
+        lines.append(f"Режим по таймфреймам: {tf_regimes}")
+    lines.append("")
+
+    lines.append("Оценка сценариев движком (0-100, независимо от модели):")
+    lines.append(f"- LONG_SCORE: {ctx.score.long_score:.0f}")
+    lines.append(f"- SHORT_SCORE: {ctx.score.short_score:.0f}")
+    lines.append(f"- NO_TRADE_SCORE: {ctx.score.no_trade_score:.0f}")
+    lines.append(f"- Решение движка: {ctx.score.decision} (качество {ctx.score.quality})")
+    if ctx.score.contributions:
+        top = sorted(ctx.score.contributions, key=lambda c: abs(c.score), reverse=True)[:6]
+        lines.append("- Основные вклады: " + ", ".join(f"{c.feature} {c.score:+.0f}" for c in top))
+    lines.append("")
+
+    primary_tf = (
+        config.STRATEGY_SCALPING_PRIMARY_TIMEFRAME
+        if ctx.score.mode == "scalping"
+        else config.STRATEGY_SWING_PRIMARY_TIMEFRAME
+    )
+    lines.append(f"Признаки, которых нет в таймфреймах выше (опорный таймфрейм {primary_tf}):")
+    trend = ctx.features.trend.get(primary_tf)
+    if trend is not None:
+        lines.append(
+            f"- Тренд: {trend.trend_state}, ADX {_fmt(trend.adx, 1)}, "
+            f"SuperTrend {trend.supertrend_direction or NA}, структура {trend.structure_direction} "
+            f"(HH={trend.higher_high}, HL={trend.higher_low}, LH={trend.lower_high}, LL={trend.lower_low}, "
+            f"break_of_structure={trend.break_of_structure}, change_of_character={trend.change_of_character})"
+        )
+    momentum = ctx.features.momentum.get(primary_tf)
+    if momentum is not None:
+        lines.append(
+            f"- Моментум: bullish_divergence={momentum.bullish_divergence}, "
+            f"bearish_divergence={momentum.bearish_divergence}"
+        )
+    volatility = ctx.features.volatility.get(primary_tf)
+    if volatility is not None:
+        lines.append(
+            f"- Волатильность: ATR percentile {_fmt(volatility.atr_percentile, 0)}%, "
+            f"сжатие диапазона={volatility.range_compression}, расширение={volatility.volatility_expansion}"
+        )
+    volume = ctx.features.volume.get(primary_tf)
+    if volume is not None:
+        lines.append(
+            f"- Объём: ratio {_fmt(volume.volume_ratio, 2)}, spike={volume.volume_spike}, "
+            f"тренд объёма={volume.volume_trend or NA}"
+        )
+    futures = ctx.features.futures
+    funding_pct = futures.funding_rate * 100 if futures.funding_rate is not None else None
+    lines.append(
+        f"- Фьючерсы: funding {_fmt_pct(funding_pct)}, изменение OI "
+        f"{_fmt_pct(futures.open_interest_change_pct)}, режим цена/OI: {futures.oi_price_regime or NA}"
+    )
+    ob = ctx.features.orderbook
+    lines.append(f"- Стакан: imbalance {_fmt(ob.imbalance, 2)}, microprice {_fmt(ob.microprice)}")
+    if ctx.features.distance_to_support_atr is not None:
+        lines.append(f"- Расстояние до поддержки: {_fmt(ctx.features.distance_to_support_atr, 2)} ATR")
+    if ctx.features.distance_to_resistance_atr is not None:
+        lines.append(f"- Расстояние до сопротивления: {_fmt(ctx.features.distance_to_resistance_atr, 2)} ATR")
+    lines.append("")
+
+    rs = ctx.risk_settings
+    lines.append("Риск-ограничения (заданы пользователем — НЕ пересчитывать и НЕ менять):")
+    lines.append(f"- Риск на сделку: {rs.risk_percent}% от депозита")
+    lines.append(f"- Максимальная маржа: {rs.max_margin_percent}%")
+    lines.append(f"- Минимальный приемлемый R:R: {rs.min_risk_reward}")
+    lines.append(f"- Плечо: {rs.leverage}x")
+    lines.append("")
+
+    lines.append(
+        "ВАЖНО: не рассчитывай размер позиции, комиссии, маржу или R:R самостоятельно — это "
+        "делает код детерминированно (Decimal-арифметика), не языковая модель. Не меняй указанные "
+        "выше риск-ограничения. Сделка никогда не открывается автоматически — финальное решение "
+        "принимает пользователь вручную, только после прохождения всех программных проверок "
+        "(валидация плана, расчёт позиции, фильтры риска)."
+    )
+    return lines
+
+
 def _timeframe_block(name: str, tf_data: dict) -> str:
     ind = tf_data["indicators"]
     lines = [
@@ -121,7 +253,7 @@ def _timeframe_block(name: str, tf_data: dict) -> str:
     return "\n".join(lines)
 
 
-def build_report(snapshot: dict) -> str:
+def build_report(snapshot: dict, ai_context: AIContext | None = None) -> str:
     ts: datetime = snapshot["timestamp"]
     ts_str = ts.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
     mode_key = snapshot.get("mode_key", "scalping")
@@ -212,6 +344,10 @@ def build_report(snapshot: dict) -> str:
     lines.append(f"- Stop loss: {_fmt(pos.stop_loss) if pos.stop_loss is not None else NA}")
     lines.append(f"- Take profit: {_fmt(pos.take_profit) if pos.take_profit is not None else NA}")
     lines.append("")
+
+    if ai_context is not None:
+        lines.extend(_ai_context_section(ai_context))
+        lines.append("")
 
     lines.append("Задача для ChatGPT:")
     lines.append(_TASK_TEXTS[mode_key].format(symbol=snapshot["symbol"]))

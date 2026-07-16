@@ -13,7 +13,7 @@ import bingx_client
 import config
 import prediction_tracker as pt
 from ai_client import AIAnalysisResult
-from ai_schema import EntryZone, RiskReward, TakeProfit, TradePlan
+from ai_schema import EntryZone, TakeProfit, TradePlan
 
 
 @pytest.fixture(autouse=True)
@@ -30,7 +30,6 @@ def _plan(signal="LONG") -> TradePlan:
         entry=EntryZone(type="LIMIT_ZONE", from_=100.0, to=101.0, trigger="x"),
         stop_loss=98.0,
         take_profits=[TakeProfit(label="TP1", price=105.0, close_percent=100)],
-        risk_reward=RiskReward(tp1=2.0),
         time_horizon_minutes=30,
         valid_for_minutes=30,
         reasons=["r"], risks=["k"], invalidation_conditions=["c"], wait_conditions=[], summary="s",
@@ -132,3 +131,35 @@ def test_wait_signal_is_skipped_not_pending():
     pt.record_results("scalping", [_ok_result(plan=_plan(signal="WAIT"))], price_at_prediction=100.5, symbol="ETH-USDT")
     entry = pt._load_all()[0]
     assert entry["status"] == "skipped"
+
+
+def test_record_results_stores_confidence_regime_prompt_version():
+    pt.record_results("scalping", [_ok_result()], price_at_prediction=100.5, symbol="ETH-USDT")
+    entry = pt._load_all()[0]
+    assert entry["confidence"] == 65
+    assert entry["market_regime"] == "TREND_UP"
+    assert entry["prompt_version"] == config.PROMPT_VERSION
+
+
+def test_evaluate_due_handles_entries_missing_new_fields(monkeypatch):
+    """Entries written before Stage 10 (no confidence/market_regime/
+    prompt_version keys) must still be readable/scoreable — .get()-safety,
+    not a hard KeyError.
+    """
+    now = 1_000_000.0
+    pt.record_results("scalping", [_ok_result()], price_at_prediction=100.5, symbol="ETH-USDT")
+    entries = pt._load_all()
+    del entries[0]["confidence"]
+    del entries[0]["market_regime"]
+    del entries[0]["prompt_version"]
+    entries[0]["predicted_at"] = now - 3600
+    pt._save_all(entries)
+
+    monkeypatch.setattr(bingx_client, "get_klines_range", lambda symbol, interval, start_ms, end_ms, limit=1500: _candles_hitting_tp1())
+
+    scored = pt.evaluate_due("ETH-USDT", now=now)
+    assert scored == 1
+    entry = pt._load_all()[0]
+    assert entry["status"] == "evaluated"
+    stats = pt.stats_by_model_and_mode("scalping")
+    assert stats["GPT"]["evaluated"] == 1

@@ -1,7 +1,7 @@
 """Offline tests for signal_freshness — no network, no AI calls."""
 
 from ai_client import AIAnalysisResult
-from ai_schema import EntryZone, RiskReward, TakeProfit, TradePlan
+from ai_schema import EntryZone, TakeProfit, TradePlan
 from signal_freshness import compute_freshness, format_age, format_remaining
 
 NOW = 1_000_000.0
@@ -16,7 +16,6 @@ def _plan(valid_for_minutes: int = 30) -> TradePlan:
         entry=EntryZone(type="LIMIT_ZONE", from_=100.0, to=101.0, trigger="x"),
         stop_loss=98.0,
         take_profits=[TakeProfit(label="TP1", price=105.0, close_percent=100)],
-        risk_reward=RiskReward(tp1=2.0),
         time_horizon_minutes=30,
         valid_for_minutes=valid_for_minutes,
         reasons=["r"],

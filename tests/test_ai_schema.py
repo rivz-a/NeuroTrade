@@ -25,13 +25,14 @@ VALID_LONG_JSON = """
     {"label": "TP2", "price": 1781.00, "close_percent": 35},
     {"label": "TP3", "price": 1785.00, "close_percent": 25}
   ],
-  "risk_reward": {"tp1": 1.2, "tp2": 2.1, "tp3": 4.1},
   "time_horizon_minutes": 30,
   "valid_for_minutes": 15,
   "reasons": ["reason1"],
   "risks": ["risk1"],
   "invalidation_conditions": ["cond1"],
   "wait_conditions": [],
+  "contradictions": [],
+  "missing_context": [],
   "summary": "test"
 }
 """
@@ -107,3 +108,21 @@ def test_wait_signal_parses():
     data["wait_conditions"] = ["Закрепление выше 1780"]
     plan = parse_ai_json(json.dumps(data))
     assert plan.signal == "WAIT"
+
+
+def test_contradictions_and_missing_context_populated():
+    data = json.loads(VALID_LONG_JSON)
+    data["contradictions"] = ["Собственная оценка режима TREND_UP расходится с переданным RANGE"]
+    data["missing_context"] = ["Не передана история ликвидаций"]
+    plan = parse_ai_json(json.dumps(data))
+    assert plan.contradictions == ["Собственная оценка режима TREND_UP расходится с переданным RANGE"]
+    assert plan.missing_context == ["Не передана история ликвидаций"]
+
+
+def test_contradictions_and_missing_context_default_to_empty_list():
+    data = json.loads(VALID_LONG_JSON)
+    del data["contradictions"]
+    del data["missing_context"]
+    plan = parse_ai_json(json.dumps(data))
+    assert plan.contradictions == []
+    assert plan.missing_context == []

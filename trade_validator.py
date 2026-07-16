@@ -25,7 +25,6 @@ MIN_RISK_REWARD = {"scalping": 1.0, "swing": 1.5}
 MAX_ENTRY_DISTANCE_ATR = 3.0
 MIN_STOP_DISTANCE_ATR = 0.15
 MAX_STOP_DISTANCE_ATR = 6.0
-RISK_REWARD_TOLERANCE = 0.2  # 20% — beyond this, declared vs computed R:R disagree
 
 
 @dataclass(frozen=True)
@@ -144,23 +143,15 @@ def _validate_directional(plan: TradePlan, mode: str, ctx: ValidationContext) ->
         if abs(plan.stop_loss - ctx.current_price) < half_spread:
             issues.append(_reject("STOP_INSIDE_SPREAD", "Stop loss находится внутри текущего спреда."))
 
-    # --- Risk/Reward: computed vs declared, and vs mode floor ---
+    # --- Risk/Reward vs mode floor (computed only — the model no longer
+    # self-reports an R:R to cross-check against; risk_manager.py/
+    # position_service.py are the authoritative R:R source once a plan
+    # exists) ---
     if tps:
         risk = abs(entry_mid - plan.stop_loss)
         reward_tp1 = abs(tps[0].price - entry_mid)
         if risk > 0:
             computed_rr = reward_tp1 / risk
-            declared_rr = plan.risk_reward.tp1
-            if declared_rr is not None and declared_rr > 0:
-                diff_ratio = abs(computed_rr - declared_rr) / declared_rr
-                if diff_ratio > RISK_REWARD_TOLERANCE:
-                    issues.append(
-                        _warn(
-                            "RR_MISMATCH",
-                            f"Заявленный R:R до TP1 ({declared_rr:.2f}) расходится с расчётным "
-                            f"({computed_rr:.2f}).",
-                        )
-                    )
             min_rr = MIN_RISK_REWARD.get(mode, MIN_RISK_REWARD["scalping"])
             if computed_rr < min_rr:
                 issues.append(

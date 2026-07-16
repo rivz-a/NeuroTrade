@@ -13,7 +13,7 @@ out to BingX or an AI model.
 from decimal import Decimal
 
 from ai_client import AIAnalysisResult
-from ai_schema import EntryZone, RiskReward, TakeProfit, TradePlan
+from ai_schema import EntryZone, TakeProfit, TradePlan
 from position_service import calculate_active_position
 from risk_manager import (
     EntryPriceMode,
@@ -44,7 +44,6 @@ def _plan(
         entry=EntryZone(type=entry_type, from_=entry_from, to=entry_to, trigger="x"),
         stop_loss=stop_loss,
         take_profits=[TakeProfit(label="TP1", price=tp1, close_percent=100)],
-        risk_reward=RiskReward(tp1=2.0),
         time_horizon_minutes=60,
         valid_for_minutes=120,
         reasons=["r"],
@@ -64,7 +63,6 @@ def _wait_plan() -> TradePlan:
         entry=EntryZone(type="NONE", from_=0.0, to=0.0, trigger=""),
         stop_loss=0.0,
         take_profits=[],
-        risk_reward=RiskReward(tp1=None),
         time_horizon_minutes=60,
         valid_for_minutes=120,
         reasons=[],
@@ -210,6 +208,38 @@ def test_changing_only_settings_changes_the_calculation_deterministically():
     assert low_risk.calculation is not None and high_risk.calculation is not None
     assert low_risk.calculation.position_size_coin_rounded != high_risk.calculation.position_size_coin_rounded
     assert high_risk.calculation.position_size_coin_rounded > low_risk.calculation.position_size_coin_rounded
+
+
+def test_margin_limited_shows_distinct_status_but_stays_openable():
+    plan = _plan(signal="LONG", entry_from=100.0, entry_to=101.0, stop_loss=95.0, tp1=115.0)
+    votes = _votes(plan)
+    result = calculate_active_position(
+        votes, "scalping", total_models=3, current_price=100.5,
+        settings=_settings(max_margin_percent=Decimal("1"), leverage=2), instrument_rules=RULES, now=NOW,
+    )
+    assert result.calculation is not None
+    assert result.calculation.limited_by == "MARGIN"
+    assert result.calculation.status == PositionStatus.VALID
+    assert result.display_status == "MARGIN_LIMIT"
+    assert result.reference_only is False
+    assert result.can_open is True
+
+
+def test_risk_limited_normal_case_stays_plain_valid():
+    # PositionCalculator always sizes by either risk-budget or margin —
+    # RISK-limited is the default/expected outcome for an ordinary trade
+    # (see test_allowed_and_valid_can_open's settings, generous margin/
+    # leverage), so it must NOT get promoted to a distinct "RISK_LIMIT"
+    # badge — that would fire on nearly every successful trade.
+    plan = _plan(signal="LONG", entry_from=100.0, entry_to=101.0, stop_loss=95.0, tp1=115.0)
+    votes = _votes(plan)
+    result = calculate_active_position(
+        votes, "scalping", total_models=3, current_price=100.5,
+        settings=_settings(), instrument_rules=RULES, now=NOW,
+    )
+    assert result.calculation is not None
+    assert result.calculation.limited_by == "RISK"
+    assert result.display_status == "VALID"
 
 
 def test_no_agreeing_plan_is_not_applicable():

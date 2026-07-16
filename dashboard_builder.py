@@ -522,7 +522,7 @@ def _trade_plan_card(consensus: ConsensusResult) -> str:
 
 _POSITION_STATUS_LABELS = {
     "VALID": "Готово к открытию",
-    "BELOW_MINIMUM_ORDER": "Ниже минимального ордера",
+    "POSITION_TOO_SMALL": "Ниже минимального ордера",
     "LOW_RISK_REWARD": "R:R ниже минимума",
     "FEES_TOO_HIGH": "Комиссии съедают прибыль",
     "INVALID_SETTINGS": "Некорректные настройки риска",
@@ -568,6 +568,19 @@ def _position_status_severity(status: str) -> str:
     if status in ("WAITING_TRIGGER", "PRICE_OUTSIDE_ENTRY_ZONE", "RISK_LIMIT", "MARGIN_LIMIT", "MISSING_MARKET_RULES"):
         return "WAIT"
     return "SHORT"
+
+
+def _stale_check_attrs(plan) -> str:
+    """`data-*` attributes read by the client-side `checkStaleSignals()`
+    ticker. Staleness has to be judged in the browser, not here: this HTML
+    is built once (at refresh/settings-save time) and can sit open in a tab
+    long past `valid_for_minutes` — the server has no way to know when a
+    page is actually being looked at, so it can't decide "is this stale
+    right now" for a viewer who opened the tab later.
+    """
+    if plan is None or plan.formed_at is None:
+        return ""
+    return f' data-formed-at="{plan.formed_at}" data-valid-minutes="{plan.valid_for_minutes}"'
 
 
 def _position_card(service_result: PositionServiceResult | None) -> str:
@@ -623,11 +636,14 @@ def _position_card(service_result: PositionServiceResult | None) -> str:
     warnings_html = _list_block("Предупреждения", calc.warnings)
     issues_html = _list_block("Проблемы", calc.issues) if calc.issues else ""
     tp_table_html = _take_profit_table(service_result)
+    stale_attrs_html = _stale_check_attrs(service_result.consensus.plan)
 
     return f"""
-    <section class="position-card">
+    <section class="position-card"{stale_attrs_html}>
       <h2>Расчёт позиции</h2>
       <span class="position-status-badge" style="--status-color: {status_color}">{html.escape(status_label)}</span>
+      <div class="stale-signal-banner" style="display: none">Сигнал устарел — с момента формирования истекло
+        заявленное окно действия. Обновите анализ, прежде чем действовать.</div>
       {reference_html}
       <div class="position-grid">{rows_html}</div>
       {warnings_html}
@@ -649,6 +665,7 @@ def _take_profit_table(service_result: PositionServiceResult) -> str:
             f'<tr class="tp-row{primary_mark}">'
             f"<td>{html.escape(tp.label)}</td>"
             f"<td>{_fmt_decimal(tp.price)}</td>"
+            f"<td>{_fmt_decimal(tp.close_percent)}%</td>"
             f"<td>{_fmt_decimal(tp.distance_percent)}%</td>"
             f"<td>{_fmt_decimal(tp.gross_profit_usdt, 4)}</td>"
             f"<td>{_fmt_decimal(tp.net_profit_usdt, 4)}</td>"
@@ -656,14 +673,34 @@ def _take_profit_table(service_result: PositionServiceResult) -> str:
             f"<td>{net_rr_str}</td>"
             "</tr>"
         )
+
+    footer_html = ""
+    blended = calc.blended
+    if blended is not None and len(calc.take_profit_results) > 1:
+        blended_net_rr_str = _fmt_decimal(blended.net_rr) if blended.net_rr is not None else "н/д"
+        footer_html = f"""
+        <tfoot>
+          <tr class="tp-row tp-row--blended">
+            <td colspan="2">Итог плана (все цели)</td>
+            <td>{_fmt_decimal(blended.total_close_percent)}%</td>
+            <td>&mdash;</td>
+            <td>{_fmt_decimal(blended.gross_profit_usdt, 4)}</td>
+            <td>{_fmt_decimal(blended.net_profit_usdt, 4)}</td>
+            <td>{_fmt_decimal(blended.gross_rr)}</td>
+            <td>{blended_net_rr_str}</td>
+          </tr>
+        </tfoot>
+        """
+
     return f"""
     <div class="tp-table-wrap">
       <table class="tp-table">
         <thead>
-          <tr><th>Цель</th><th>Цена</th><th>&Delta;%</th><th>Валовая, USDT</th><th>Чистая, USDT</th>
-          <th>Gross R:R</th><th>Net R:R</th></tr>
+          <tr><th>Цель</th><th>Цена</th><th>% закрытия</th><th>&Delta;%</th><th>Валовая, USDT</th>
+          <th>Чистая, USDT</th><th>Gross R:R</th><th>Net R:R</th></tr>
         </thead>
         <tbody>{"".join(rows)}</tbody>
+        {footer_html}
       </table>
     </div>
     """
@@ -690,14 +727,20 @@ def _bingx_card(service_result: PositionServiceResult | None) -> str:
 
     if service_result.can_open:
         action_html = (
-            '<div class="bingx-action bingx-action--allowed">'
+            '<div class="bingx-action bingx-action--allowed" data-original-text="'
+            f'Финальное действие: нажать «Открыть {html.escape(side_label.lower())}»">'
             f"Финальное действие: нажать «Открыть {html.escape(side_label.lower())}»</div>"
         )
     else:
         action_html = (
             '<div class="bingx-action bingx-action--blocked">'
-            "Не размещать ордер до выполнения условия входа.</div>"
+            f"{html.escape(service_result.display_message)} Не размещать ордер.</div>"
         )
+
+    tp_count = len(service_result.consensus.plan.take_profits)
+    tp_label = "TP1"
+    if tp_count > 1:
+        tp_label = f"TP1 (+{tp_count - 1} доп. цели — вручную)"
 
     rows = [
         ("Режим маржи", margin_mode_label),
@@ -705,8 +748,12 @@ def _bingx_card(service_result: PositionServiceResult | None) -> str:
         ("Направление", side_label.upper()),
         ("Тип ордера", order_type_label),
         ("Цена", _fmt_decimal(fields.price)),
-        ("Take profit (TP1)", _fmt_decimal(fields.take_profit) if fields.take_profit is not None else "н/д"),
+        ("Количество", f"{_fmt_decimal(fields.coin_quantity, 4)} {base_asset}"),
+        ("Номинал", f"{_fmt_decimal(fields.notional_usdt)} USDT"),
+        ("Маржа", f"{_fmt_decimal(fields.margin_usdt)} USDT"),
+        (tp_label, _fmt_decimal(fields.take_profit) if fields.take_profit is not None else "н/д"),
         ("Stop loss", _fmt_decimal(fields.stop_loss)),
+        ("Статус размещения", html.escape(status_label)),
         ("Поле ввода в BingX", input_mode_label),
         ("Значение поля", selected_value_str),
     ]
@@ -716,22 +763,25 @@ def _bingx_card(service_result: PositionServiceResult | None) -> str:
         for label, value in rows
     )
 
-    extra_html = (
-        '<div class="bingx-extra">'
-        f"Маржа: {_fmt_decimal(fields.margin_usdt)} USDT &middot; "
-        f"Номинал: {_fmt_decimal(fields.notional_usdt)} USDT &middot; "
-        f"Количество: {_fmt_decimal(fields.coin_quantity, 4)} {html.escape(base_asset)}"
-        "</div>"
-    )
+    tp_hint_html = ""
+    if tp_count > 1:
+        tp_hint_html = (
+            '<p class="bingx-hint">В поле TP BingX уходит только первая цель (TP1) — '
+            f"остальные {tp_count - 1} нужно выставить отдельными ручными ордерами после входа.</p>"
+        )
+
+    stale_attrs_html = _stale_check_attrs(service_result.consensus.plan)
 
     return f"""
-    <section class="bingx-card">
+    <section class="bingx-card"{stale_attrs_html}>
       <h2>Что заполнить в BingX</h2>
       <span class="position-status-badge" style="--status-color: {status_color}">{html.escape(status_label)}</span>
+      <div class="stale-signal-banner" style="display: none">Сигнал устарел — с момента формирования истекло
+        заявленное окно действия. Обновите анализ, прежде чем действовать.</div>
       <div class="bingx-fields">{rows_html}</div>
-      {extra_html}
       <p class="bingx-hint">Проверьте, какой режим ввода выбран в форме ордера BingX — расчёт выполнен для режима
         «{html.escape(input_mode_label)}».</p>
+      {tp_hint_html}
       {action_html}
     </section>
     """
@@ -1856,6 +1906,13 @@ def build_dashboard(
     font-weight: 600;
   }}
   .tp-row--primary td {{ color: var(--text-primary); font-weight: 700; }}
+  .tp-table tfoot td {{
+    border-top: 2px solid var(--gridline);
+    border-bottom: none;
+    background: var(--page-plane);
+    color: var(--text-primary);
+    font-weight: 700;
+  }}
   .bingx-fields {{
     display: grid;
     grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
@@ -1904,6 +1961,21 @@ def build_dashboard(
     background: color-mix(in srgb, {_STATUS["SHORT"]["light"]} 12%, transparent);
     border: 1px solid {_STATUS["SHORT"]["light"]};
     color: var(--text-primary);
+  }}
+  .stale-signal-banner {{
+    margin: 10px 0;
+    padding: 8px 10px;
+    border-radius: 8px;
+    background: color-mix(in srgb, {_STATUS["SHORT"]["light"]} 14%, transparent);
+    border: 1px solid {_STATUS["SHORT"]["light"]};
+    color: var(--text-primary);
+    font-size: 12px;
+    font-weight: 600;
+  }}
+  .position-card.js-stale, .bingx-card.js-stale {{ opacity: 0.6; }}
+  .position-card.js-stale .position-status-badge,
+  .bingx-card.js-stale .position-status-badge {{
+    --status-color: {_STATUS["SHORT"]["light"]} !important;
   }}
 </style>
 </head>
@@ -2196,6 +2268,37 @@ def build_dashboard(
         buttons.forEach(function (b) {{ b.disabled = false; }});
       }});
   }}
+
+  function checkStaleSignals() {{
+    var nowSec = Date.now() / 1000;
+    document.querySelectorAll('.position-card[data-formed-at], .bingx-card[data-formed-at]').forEach(function (card) {{
+      var formedAt = parseFloat(card.dataset.formedAt);
+      var validMinutes = parseFloat(card.dataset.validMinutes);
+      if (!isFinite(formedAt) || !isFinite(validMinutes)) return;
+      var stale = nowSec >= formedAt + validMinutes * 60;
+      card.classList.toggle('js-stale', stale);
+      var banner = card.querySelector('.stale-signal-banner');
+      if (banner) banner.style.display = stale ? 'block' : 'none';
+
+      var action = card.querySelector('.bingx-action--allowed');
+      if (action) {{
+        if (stale) {{
+          action.classList.remove('bingx-action--allowed');
+          action.classList.add('bingx-action--blocked');
+          action.textContent = 'Сигнал устарел — не открывать.';
+        }}
+      }} else {{
+        var blocked = card.querySelector('.bingx-action--blocked[data-original-text]');
+        if (blocked && !stale) {{
+          blocked.classList.remove('bingx-action--blocked');
+          blocked.classList.add('bingx-action--allowed');
+          blocked.textContent = blocked.dataset.originalText;
+        }}
+      }}
+    }});
+  }}
+  checkStaleSignals();
+  setInterval(checkStaleSignals, 30000);
 </script>
 </body>
 </html>
