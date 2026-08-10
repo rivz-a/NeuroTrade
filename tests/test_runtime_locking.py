@@ -1,5 +1,6 @@
 """Offline tests for runtime/locking.py — no network, no subprocess. Uses
-real msvcrt file locks against a pytest tmp_path.
+real OS file locks (msvcrt on Windows, fcntl on POSIX) against a pytest
+tmp_path.
 """
 
 from __future__ import annotations

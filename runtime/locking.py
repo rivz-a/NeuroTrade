@@ -2,17 +2,17 @@
 file lock — not a bare PID file. A PID file survives a crash (the PID it
 names may no longer exist, or may have been reused by an unrelated
 process) and can't answer "is the previous runtime actually still alive"
-on its own; an OS lock is released automatically by Windows the instant
-the holding process dies or is killed, so a stale lock is not possible.
+on its own; an OS lock is released automatically the instant the holding
+process dies or is killed, so a stale lock is not possible.
 
-Windows-only (this project runs on win32) — uses the stdlib `msvcrt`
-module rather than a third-party cross-platform locking library, since a
-single OS-specific primitive is all that's needed here.
+Cross-platform: uses `msvcrt` on Windows and `fcntl` on POSIX (Linux/macOS,
+i.e. the VDS this runs on in production) — both are stdlib, so no
+third-party locking library is needed for this single primitive.
 """
 
 from __future__ import annotations
 
-import msvcrt
+import sys
 from pathlib import Path
 from typing import BinaryIO
 
@@ -21,6 +21,26 @@ _LOCK_BYTE_COUNT = 1
 
 class RuntimeLockError(Exception):
     """Raised when another instance already holds the runtime lock."""
+
+
+if sys.platform == "win32":
+    import msvcrt
+
+    def _lock(handle: BinaryIO) -> None:
+        handle.seek(0)
+        msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, _LOCK_BYTE_COUNT)
+
+    def _unlock(handle: BinaryIO) -> None:
+        handle.seek(0)
+        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, _LOCK_BYTE_COUNT)
+else:
+    import fcntl
+
+    def _lock(handle: BinaryIO) -> None:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+    def _unlock(handle: BinaryIO) -> None:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
 def acquire_lock(path: Path) -> BinaryIO:
@@ -39,7 +59,7 @@ def acquire_lock(path: Path) -> BinaryIO:
         handle.flush()
     handle.seek(0)
     try:
-        msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, _LOCK_BYTE_COUNT)
+        _lock(handle)
     except OSError as exc:
         handle.close()
         raise RuntimeLockError(
@@ -50,7 +70,6 @@ def acquire_lock(path: Path) -> BinaryIO:
 
 def release_lock(handle: BinaryIO) -> None:
     try:
-        handle.seek(0)
-        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, _LOCK_BYTE_COUNT)
+        _unlock(handle)
     finally:
         handle.close()
