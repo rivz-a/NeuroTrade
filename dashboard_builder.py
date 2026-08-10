@@ -17,6 +17,8 @@ import time
 from datetime import datetime, timezone
 
 import config
+import journal_db
+import paper_trading
 import position_service
 import prediction_tracker
 import risk_settings_store
@@ -1064,17 +1066,119 @@ def _accuracy_panel(mode: str) -> str:
     """
 
 
+def _paper_trading_row(label: str, s: paper_trading.BucketStats) -> str:
+    win_rate = s.win_rate
+    n = s.evaluated
+    severity = _win_rate_severity(win_rate, s.low_sample)
+    fill_pct = win_rate if win_rate is not None else 0
+
+    if win_rate is None:
+        rate_str = "н/д"
+    elif s.low_sample:
+        rate_str = f"{_fmt_win_rate(win_rate)} (мало данных)"
+    else:
+        rate_str = _fmt_win_rate(win_rate)
+
+    still_open = s.total - n
+    sample_note = f"{s.wins} побед из {n}" if n else "ещё нет закрытых сделок"
+    if still_open:
+        sample_note += f" · открыто/в процессе: {still_open}"
+
+    metrics_html = ""
+    breakdown_html = ""
+    if n:
+        metrics_html = (
+            '<div class="accuracy-row-metrics">'
+            f"Expectancy: <strong>{_fmt_r(s.expectancy_r)}</strong> &middot; "
+            f"Profit factor: <strong>{html.escape(_fmt_profit_factor(s.profit_factor, s.profit_factor_undefined))}</strong> &middot; "
+            f"Медиана: <strong>{_fmt_r(s.median_r)}</strong> &middot; "
+            f"Max DD: <strong>{_fmt_r(s.max_drawdown_r)}</strong>"
+            "</div>"
+        )
+        breakdown = _exit_reason_breakdown(s.exit_reason_counts)
+        if breakdown:
+            breakdown_html = f'<div class="accuracy-row-breakdown">{breakdown}</div>'
+
+    slot = _slot_for_label(label)
+
+    return f"""
+    <div class="accuracy-row">
+      <div class="accuracy-row-head">
+        <span class="accuracy-chip" style="background: var(--slot-{slot})" aria-hidden="true"></span>
+        <span class="accuracy-row-label">{html.escape(label)}</span>
+        <span class="accuracy-row-rate" style="--status-color: {severity["light"]}">{rate_str}</span>
+      </div>
+      <div class="accuracy-meter" style="--status-color: {severity["light"]}">
+        <div class="accuracy-meter-fill" style="width: {fill_pct:.0f}%"></div>
+      </div>
+      <div class="accuracy-row-detail">{html.escape(sample_note)}</div>
+      {metrics_html}
+      {breakdown_html}
+    </div>
+    """
+
+
+def _paper_trading_panel(mode: str) -> str:
+    """Real paper-engine performance for ONE mode, pulled live from
+    journal_db (paper_orders/trade_outcomes) — the actual simulated fills,
+    fees and slippage from `paper_trading.process_tick`, scoped to
+    whichever AI model's plan was actually opened as a paper order.
+
+    Deliberately separate from `_accuracy_panel` above, which grades every
+    AI prediction (even ones nothing ever opened a position for) against a
+    simulated candle-path outcome — different question, different number.
+    Best-effort: journal.db may not exist yet (fresh deploy, runtime never
+    ticked) or a read could race a concurrent writer — either way this
+    degrades to the empty-state panel rather than breaking the page.
+    """
+    try:
+        conn = journal_db.init_db()
+        try:
+            stats = paper_trading.compute_paper_trading_statistics(
+                conn, mode=mode, window_start=0.0, window_end=time.time()
+            )
+        finally:
+            conn.close()
+    except Exception:
+        stats = None
+
+    if not stats or not stats.by_model:
+        return (
+            '<section class="accuracy-panel">'
+            f"<h2>Paper trading &middot; {html.escape(MODE_LABELS[mode])}</h2>"
+            '<p class="accuracy-empty">Пока нет ни одной открытой paper-сделки для этого режима — '
+            "накопится по мере работы trading_runtime.py.</p>"
+            "</section>"
+        )
+
+    order = _label_order()
+    labels = sorted(stats.by_model.keys(), key=lambda label: (order.index(label) if label in order else 99, label))
+    rows_html = "".join(_paper_trading_row(label, stats.by_model[label]) for label in labels)
+
+    return f"""
+    <section class="accuracy-panel">
+      <h2>Paper trading &middot; {html.escape(MODE_LABELS[mode])}</h2>
+      <p class="accuracy-intro">
+        Реальные paper-сделки, открытые и сопровождаемые движком (реальный bid/ask, комиссии,
+        проскальзывание, SL/TP/трейлинг) — не симуляция по свечам, а фактический учёт в journal.db.
+      </p>
+      {rows_html}
+    </section>
+    """
+
+
 def _mode_toggle_and_grids(
     results_by_mode: dict[str, list[AIAnalysisResult]],
     default_mode: str,
     symbol: str,
     settings: RiskSettings,
     current_price: float | None = None,
-) -> tuple[str, str, str, str]:
+) -> tuple[str, str, str, str, str]:
     """Build the segmented-control toggle, the (hidden/shown) per-mode card
     grids, the (hidden/shown) per-mode consensus + trade-plan + position/
-    BingX summary, and the (hidden/shown) per-mode accuracy panel — all four
-    share the same `data-mode` show/hide pattern driven by `setDashboardMode()`.
+    BingX summary, the (hidden/shown) per-mode AI-accuracy panel, and the
+    (hidden/shown) per-mode real paper-trading panel — all five share the
+    same `data-mode` show/hide pattern driven by `setDashboardMode()`.
     """
     modes = [m for m in ("scalping", "swing") if m in results_by_mode]
     if default_mode not in modes:
@@ -1091,6 +1195,7 @@ def _mode_toggle_and_grids(
     grids = []
     summaries = []
     accuracy_panels = []
+    paper_trading_panels = []
     for mode in modes:
         results = results_by_mode[mode]
         ok_count = sum(1 for r in results if r.ok)
@@ -1141,8 +1246,19 @@ def _mode_toggle_and_grids(
             f'style="display: {"block" if is_active else "none"}">{_accuracy_panel(mode)}</div>'
         )
 
+        paper_trading_panels.append(
+            f'<div class="mode-accuracy" data-mode="{html.escape(mode)}" '
+            f'style="display: {"block" if is_active else "none"}">{_paper_trading_panel(mode)}</div>'
+        )
+
     toggle_html = f'<div class="mode-toggle" role="tablist" aria-label="Стиль анализа">{"".join(toggle_buttons)}</div>'
-    return toggle_html, "".join(grids), "".join(summaries), "".join(accuracy_panels)
+    return (
+        toggle_html,
+        "".join(grids),
+        "".join(summaries),
+        "".join(accuracy_panels),
+        "".join(paper_trading_panels),
+    )
 
 
 def build_dashboard(
@@ -1168,7 +1284,7 @@ def build_dashboard(
     )
 
     risk_settings = risk_settings_store.load()
-    toggle_html, grids_html, summary_html, accuracy_html = _mode_toggle_and_grids(
+    toggle_html, grids_html, summary_html, accuracy_html, paper_trading_html = _mode_toggle_and_grids(
         results_by_mode, default_mode, snapshot["symbol"], risk_settings, snapshot.get("current_price")
     )
     risk_settings_modal_html = _risk_settings_modal(risk_settings)
@@ -2064,6 +2180,8 @@ def build_dashboard(
   {grids_html}
 
   {accuracy_html}
+
+  {paper_trading_html}
 
   <footer class="page-footer">
     Переключатель наверху меняет стиль анализа (скальпинг / длинная свинг-сделка). Кнопка «Обновить» заново
