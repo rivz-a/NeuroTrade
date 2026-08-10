@@ -36,3 +36,33 @@ def is_heartbeat_stale(heartbeat: dict, max_age_seconds: float, now: float | Non
     if last is None:
         return True
     return (now - last) > max_age_seconds
+
+
+def heartbeat_status(path: Path, max_age_seconds: float, now: float | None = None) -> dict:
+    """Normalized summary for UI/monitoring consumers (dashboard badge,
+    /api/status) — one place to turn the raw heartbeat file into a
+    tri-state "state" so callers never re-derive the ok/stale/unknown logic
+    themselves.
+
+    "unknown" (no file yet, e.g. right after a fresh deploy before the
+    runtime's first tick, or the file failed to parse) is kept distinct
+    from "stale" (was alive, has since gone quiet) since they call for
+    different UI treatment.
+    """
+    now = now if now is not None else time.time()
+    heartbeat = read_heartbeat(path)
+    if heartbeat is None:
+        return {"state": "unknown", "age_seconds": None}
+
+    last = heartbeat.get("last_heartbeat_at")
+    age_seconds = (now - last) if last is not None else None
+    state = "stale" if is_heartbeat_stale(heartbeat, max_age_seconds, now=now) else "ok"
+    return {
+        "state": state,
+        "age_seconds": age_seconds,
+        "mode": heartbeat.get("mode"),
+        "symbol": heartbeat.get("symbol"),
+        "open_paper_positions": heartbeat.get("open_paper_positions"),
+        "open_real_positions": heartbeat.get("open_real_positions"),
+        "last_error": heartbeat.get("last_error"),
+    }

@@ -26,6 +26,7 @@ from consensus_engine import ConsensusResult, compute_consensus
 from position_service import PositionServiceResult
 from report_builder import MODE_LABELS
 from risk_manager import RiskSettings
+from runtime.heartbeat import heartbeat_status
 from signal_freshness import Freshness, compute_freshness, format_age, format_remaining
 from trade_validator import ValidationIssue, ValidationResult
 
@@ -183,6 +184,44 @@ def _data_freshness_dot(age_seconds: float) -> str:
     else:
         color = _STATUS["SHORT"]["light"]
     return f'<span class="freshness-dot" style="--status-color: {color}" aria-hidden="true"></span>'
+
+
+def _runtime_heartbeat_text(status: dict) -> str:
+    """Plain-text label for the runtime-liveness badge — shared by the
+    server-rendered initial state and the client-side poll loop (which
+    receives the same `heartbeat_status()` shape as JSON from /api/status
+    and must format it identically, so this exact wording also has a JS
+    twin in the <script> block below; keep the two in sync if either
+    changes).
+    """
+    state = status.get("state")
+    if state == "ok":
+        age = status.get("age_seconds") or 0
+        mode = status.get("mode") or "?"
+        paper = status.get("open_paper_positions")
+        real = status.get("open_real_positions")
+        parts = [f"Runtime: активен ({mode})"]
+        if paper is not None or real is not None:
+            parts.append(f"{paper if paper is not None else '?'} paper / {real if real is not None else '?'} real")
+        parts.append(f"тик {int(age)}с назад")
+        return " · ".join(parts)
+    if state == "stale":
+        age = status.get("age_seconds")
+        age_str = f"{int(age)}с" if age is not None else "?"
+        return f"Runtime: не отвечает ({age_str})"
+    return "Runtime: нет данных"
+
+
+def _runtime_heartbeat_badge(status: dict) -> str:
+    state = status.get("state")
+    color = {"ok": _STATUS["LONG"]["light"], "stale": _STATUS["SHORT"]["light"]}.get(state, "var(--text-muted)")
+    text = html.escape(_runtime_heartbeat_text(status))
+    return (
+        f'<span id="runtime-heartbeat" class="runtime-heartbeat" data-state="{html.escape(state or "unknown")}">'
+        f'<span class="freshness-dot" style="--status-color: {color}" aria-hidden="true"></span>'
+        f'<span id="runtime-heartbeat-text">{text}</span>'
+        f"</span>"
+    )
 
 
 def _freshness_badge(freshness: Freshness | None) -> str:
@@ -1132,6 +1171,8 @@ def build_dashboard(
         results_by_mode, default_mode, snapshot["symbol"], risk_settings, snapshot.get("current_price")
     )
     risk_settings_modal_html = _risk_settings_modal(risk_settings)
+    runtime_status = heartbeat_status(config.RUNTIME_HEARTBEAT_FILE, config.RUNTIME_HEARTBEAT_STALE_SECONDS)
+    runtime_heartbeat_html = _runtime_heartbeat_badge(runtime_status)
 
     return f"""<!doctype html>
 <html lang="ru">
@@ -1458,6 +1499,11 @@ def build_dashboard(
     border-radius: 50%;
     background: var(--status-color);
     margin-right: 2px;
+  }}
+  .runtime-heartbeat {{
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
   }}
   .freshness-badge {{
     color: var(--text-muted);
@@ -1985,6 +2031,7 @@ def build_dashboard(
     <div>
       <h1>{html.escape(snapshot["symbol"])} &middot; {html.escape(snapshot["exchange"])}</h1>
       <div class="subtitle">{freshness_dot} {html.escape(ts_str)} &middot; данные обновлены {html.escape(age_str)}</div>
+      <div class="subtitle">{runtime_heartbeat_html}</div>
     </div>
     <div class="refresh-area">
       <span id="refresh-status" class="refresh-status"></span>
@@ -2299,6 +2346,42 @@ def build_dashboard(
   }}
   checkStaleSignals();
   setInterval(checkStaleSignals, 30000);
+
+  var RUNTIME_HEARTBEAT_COLORS = {{ ok: '#0ca30c', stale: '#d03b3b' }};
+
+  function formatRuntimeHeartbeat(status) {{
+    if (!status || status.state === 'unknown') return 'Runtime: нет данных';
+    if (status.state === 'stale') {{
+      var staleAge = (status.age_seconds != null) ? Math.floor(status.age_seconds) + 'с' : '?';
+      return 'Runtime: не отвечает (' + staleAge + ')';
+    }}
+    var parts = ['Runtime: активен (' + (status.mode || '?') + ')'];
+    if (status.open_paper_positions != null || status.open_real_positions != null) {{
+      var paper = (status.open_paper_positions != null) ? status.open_paper_positions : '?';
+      var real = (status.open_real_positions != null) ? status.open_real_positions : '?';
+      parts.push(paper + ' paper / ' + real + ' real');
+    }}
+    parts.push('тик ' + Math.floor(status.age_seconds || 0) + 'с назад');
+    return parts.join(' · ');
+  }}
+
+  function pollRuntimeHeartbeat() {{
+    var badge = document.getElementById('runtime-heartbeat');
+    var text = document.getElementById('runtime-heartbeat-text');
+    if (!badge || !text) return;
+    fetch('/api/status', {{ cache: 'no-store' }})
+      .then(function (resp) {{ return resp.json(); }})
+      .then(function (data) {{
+        var status = data && data.runtime;
+        text.textContent = formatRuntimeHeartbeat(status);
+        var dot = badge.querySelector('.freshness-dot');
+        var color = (status && RUNTIME_HEARTBEAT_COLORS[status.state]) || 'var(--text-muted)';
+        if (dot) dot.style.setProperty('--status-color', color);
+        badge.dataset.state = (status && status.state) || 'unknown';
+      }})
+      .catch(function () {{ /* dashboard server itself unreachable -- leave last-known state shown */ }});
+  }}
+  setInterval(pollRuntimeHeartbeat, 5000);
 </script>
 </body>
 </html>

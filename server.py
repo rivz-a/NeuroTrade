@@ -40,6 +40,7 @@ from dashboard_builder import build_dashboard
 from market_data import fetch_snapshot
 from report_builder import MODE_LABELS, build_report
 from risk_manager import PositionCalculator, TakeProfitTarget, TradeScenario
+from runtime.heartbeat import heartbeat_status
 from trade_validator import build_validation_context
 
 # Minimum gap between two refreshes of the *same* mode. This is not about
@@ -186,7 +187,11 @@ def _status_snapshot(state: _State) -> dict:
                 "total_count": len(results),
                 "updated_at": state.last_updated_at.get(mode),
             }
-        return {"active_mode": state.active_mode, "modes": modes}
+        return {
+            "active_mode": state.active_mode,
+            "modes": modes,
+            "runtime": heartbeat_status(config.RUNTIME_HEARTBEAT_FILE, config.RUNTIME_HEARTBEAT_STALE_SECONDS),
+        }
 
 
 def _calculate_position_from_request(body: dict):

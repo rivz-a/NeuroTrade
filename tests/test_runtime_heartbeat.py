@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from runtime.heartbeat import is_heartbeat_stale, read_heartbeat, write_heartbeat
+from runtime.heartbeat import heartbeat_status, is_heartbeat_stale, read_heartbeat, write_heartbeat
 
 
 def test_write_read_round_trip(tmp_path):
@@ -38,3 +38,38 @@ def test_is_heartbeat_stale_past_threshold():
 
 def test_is_heartbeat_stale_missing_timestamp_is_stale():
     assert is_heartbeat_stale({}, max_age_seconds=15) is True
+
+
+def test_heartbeat_status_missing_file_is_unknown(tmp_path):
+    status = heartbeat_status(tmp_path / "does_not_exist.json", max_age_seconds=15)
+    assert status == {"state": "unknown", "age_seconds": None}
+
+
+def test_heartbeat_status_fresh_is_ok(tmp_path):
+    path = tmp_path / "heartbeat.json"
+    write_heartbeat(
+        path, mode="PAPER", symbol="ETHUSDT", open_paper_positions=1, open_real_positions=0, last_error=None
+    )
+    status = heartbeat_status(path, max_age_seconds=15)
+    assert status["state"] == "ok"
+    assert status["mode"] == "PAPER"
+    assert status["symbol"] == "ETHUSDT"
+    assert status["open_paper_positions"] == 1
+    assert status["open_real_positions"] == 0
+    assert status["age_seconds"] >= 0
+
+
+def test_heartbeat_status_past_threshold_is_stale(tmp_path):
+    path = tmp_path / "heartbeat.json"
+    write_heartbeat(path, mode="PAPER", symbol="ETHUSDT")
+    hb = read_heartbeat(path)
+    status = heartbeat_status(path, max_age_seconds=15, now=hb["last_heartbeat_at"] + 20)
+    assert status["state"] == "stale"
+    assert status["age_seconds"] == 20
+
+
+def test_heartbeat_status_surfaces_last_error(tmp_path):
+    path = tmp_path / "heartbeat.json"
+    write_heartbeat(path, mode="PAPER", symbol="ETHUSDT", last_error="process_tick failed: boom")
+    status = heartbeat_status(path, max_age_seconds=15)
+    assert status["last_error"] == "process_tick failed: boom"
