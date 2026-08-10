@@ -73,3 +73,30 @@ def test_heartbeat_status_surfaces_last_error(tmp_path):
     write_heartbeat(path, mode="PAPER", symbol="ETHUSDT", last_error="process_tick failed: boom")
     status = heartbeat_status(path, max_age_seconds=15)
     assert status["last_error"] == "process_tick failed: boom"
+
+
+def test_heartbeat_status_ai_cycle_uses_busy_threshold_instead_of_stale(tmp_path):
+    path = tmp_path / "heartbeat.json"
+    write_heartbeat(path, mode="PAPER", symbol="ETHUSDT", activity="ai_cycle")
+    hb = read_heartbeat(path)
+    # 40s would be "stale" under the normal 15s budget, but this heartbeat
+    # is tagged as a busy AI cycle, so the wider 150s budget applies.
+    status = heartbeat_status(path, max_age_seconds=15, busy_max_age_seconds=150, now=hb["last_heartbeat_at"] + 40)
+    assert status["state"] == "ok"
+    assert status["activity"] == "ai_cycle"
+
+
+def test_heartbeat_status_ai_cycle_still_goes_stale_past_the_busy_budget(tmp_path):
+    path = tmp_path / "heartbeat.json"
+    write_heartbeat(path, mode="PAPER", symbol="ETHUSDT", activity="ai_cycle")
+    hb = read_heartbeat(path)
+    status = heartbeat_status(path, max_age_seconds=15, busy_max_age_seconds=150, now=hb["last_heartbeat_at"] + 200)
+    assert status["state"] == "stale"
+
+
+def test_heartbeat_status_non_ai_cycle_ignores_busy_threshold(tmp_path):
+    path = tmp_path / "heartbeat.json"
+    write_heartbeat(path, mode="PAPER", symbol="ETHUSDT")  # no "activity" field
+    hb = read_heartbeat(path)
+    status = heartbeat_status(path, max_age_seconds=15, busy_max_age_seconds=150, now=hb["last_heartbeat_at"] + 40)
+    assert status["state"] == "stale"

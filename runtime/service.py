@@ -10,7 +10,7 @@ concurrency asyncio buys isn't needed here, and would mean either wrapping
 every sqlite3 call in run_in_executor or switching to aiosqlite for no real
 benefit.
 
-Two cadences, tracked by elapsed wall-clock time (not an iteration
+Three cadences, tracked by elapsed wall-clock time (not an iteration
 counter, which would drift if a tick ever takes longer than usual):
   - FAST (config.RUNTIME_FAST_INTERVAL_SECONDS, default 2s): one market
     data fetch, then paper_trading.process_tick (RUNTIME_MODE="PAPER" only).
@@ -20,6 +20,14 @@ counter, which would drift if a tick ever takes longer than usual):
     own price internally (see the plan for why a full price-injection
     refactor across Stages 11-12 was out of scope here); running them less
     often keeps the extra BingX calls low without touching that code.
+  - AI_CYCLE (config.RUNTIME_AI_CYCLE_INTERVAL_SECONDS, default = this
+    process's trading mode's own prediction horizon): runtime/ai_cycle.py —
+    fetch fresh data, ask the AI, and open a paper position if the
+    consensus is actionable. RUNTIME_MODE="PAPER" only, and skipped
+    (without consuming/advancing the interval) while a pending/open PAPER
+    order already exists for the symbol, so this app never stacks more
+    than one paper position at a time the same way the plan for eventual
+    real trading insists on ("один ордер одновременно").
 
 execution_engine.confirm_and_execute (placing a NEW real order) is never
 called from here — that stays a separate, manual action. This runtime only
@@ -39,7 +47,7 @@ import journal_db
 import market_data_engine
 import paper_trading
 import position_manager
-from runtime import heartbeat, locking
+from runtime import ai_cycle, heartbeat, locking
 
 
 class _ShutdownRequested(Exception):
@@ -59,6 +67,7 @@ class RuntimeTickResult:
     market_data_quality: str | None
     paper_tick: paper_trading.TickResult | None
     real_monitor_ran: bool
+    ai_cycle_result: ai_cycle.AICycleResult | None = None
     errors: list[str] = field(default_factory=list)
 
 
@@ -68,6 +77,7 @@ class TradingRuntime:
         self._conn = conn if conn is not None else journal_db.init_db()
         self._lock_handle = None
         self._last_medium_run: float = 0.0
+        self._last_ai_cycle_run: float = 0.0
 
     # -----------------------------------------------------------------
     # Startup recovery
@@ -149,6 +159,38 @@ class TradingRuntime:
 
         open_paper = journal_db.get_open_positions(self._conn, self.symbol, source="PAPER")
         open_real = journal_db.get_open_positions(self._conn, self.symbol, source="REAL")
+
+        ai_cycle_result: ai_cycle.AICycleResult | None = None
+        if config.RUNTIME_MODE == "PAPER" and now - self._last_ai_cycle_run >= config.RUNTIME_AI_CYCLE_INTERVAL_SECONDS:
+            pending_paper_orders = journal_db.get_pending_paper_orders(self._conn, self.symbol)
+            if not pending_paper_orders and not open_paper:
+                self._last_ai_cycle_run = now
+                # An AI cycle can block for up to ~AI_REQUEST_TIMEOUT seconds
+                # (all 3 models run in parallel, but that's still far past
+                # RUNTIME_HEARTBEAT_STALE_SECONDS) — write a heartbeat NOW,
+                # tagged "ai_cycle", so heartbeat_status() applies the wider
+                # busy-stale budget instead of flagging this as a hang.
+                heartbeat.write_heartbeat(
+                    config.RUNTIME_HEARTBEAT_FILE,
+                    pid=None,
+                    mode=config.RUNTIME_MODE,
+                    symbol=self.symbol,
+                    last_tick_at=now,
+                    market_data_quality=data_quality,
+                    open_paper_positions=len(open_paper),
+                    open_real_positions=len(open_real),
+                    last_error=errors[-1] if errors else None,
+                    activity="ai_cycle",
+                )
+                try:
+                    ai_cycle_result = ai_cycle.run_ai_cycle(self._conn, self.symbol, config.TRADING_MODE, now=now)
+                    self._conn.commit()
+                except Exception as exc:  # best-effort, same as paper tick/monitor above
+                    errors.append(f"ai_cycle failed: {exc}")
+                # A just-opened paper position changes both counts below.
+                open_paper = journal_db.get_open_positions(self._conn, self.symbol, source="PAPER")
+                open_real = journal_db.get_open_positions(self._conn, self.symbol, source="REAL")
+
         heartbeat.write_heartbeat(
             config.RUNTIME_HEARTBEAT_FILE,
             pid=None,
@@ -165,6 +207,7 @@ class TradingRuntime:
             market_data_quality=data_quality,
             paper_tick=paper_tick_result,
             real_monitor_ran=real_monitor_ran,
+            ai_cycle_result=ai_cycle_result,
             errors=errors,
         )
 

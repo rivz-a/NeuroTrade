@@ -190,7 +190,11 @@ def _status_snapshot(state: _State) -> dict:
         return {
             "active_mode": state.active_mode,
             "modes": modes,
-            "runtime": heartbeat_status(config.RUNTIME_HEARTBEAT_FILE, config.RUNTIME_HEARTBEAT_STALE_SECONDS),
+            "runtime": heartbeat_status(
+                config.RUNTIME_HEARTBEAT_FILE,
+                config.RUNTIME_HEARTBEAT_STALE_SECONDS,
+                busy_max_age_seconds=config.RUNTIME_HEARTBEAT_BUSY_STALE_SECONDS,
+            ),
         }
 
 

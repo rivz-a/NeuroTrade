@@ -200,7 +200,8 @@ def _runtime_heartbeat_text(status: dict) -> str:
         mode = status.get("mode") or "?"
         paper = status.get("open_paper_positions")
         real = status.get("open_real_positions")
-        parts = [f"Runtime: активен ({mode})"]
+        label = "анализирует рынок" if status.get("activity") == "ai_cycle" else "активен"
+        parts = [f"Runtime: {label} ({mode})"]
         if paper is not None or real is not None:
             parts.append(f"{paper if paper is not None else '?'} paper / {real if real is not None else '?'} real")
         parts.append(f"тик {int(age)}с назад")
@@ -1171,7 +1172,11 @@ def build_dashboard(
         results_by_mode, default_mode, snapshot["symbol"], risk_settings, snapshot.get("current_price")
     )
     risk_settings_modal_html = _risk_settings_modal(risk_settings)
-    runtime_status = heartbeat_status(config.RUNTIME_HEARTBEAT_FILE, config.RUNTIME_HEARTBEAT_STALE_SECONDS)
+    runtime_status = heartbeat_status(
+        config.RUNTIME_HEARTBEAT_FILE,
+        config.RUNTIME_HEARTBEAT_STALE_SECONDS,
+        busy_max_age_seconds=config.RUNTIME_HEARTBEAT_BUSY_STALE_SECONDS,
+    )
     runtime_heartbeat_html = _runtime_heartbeat_badge(runtime_status)
 
     return f"""<!doctype html>
@@ -2355,7 +2360,8 @@ def build_dashboard(
       var staleAge = (status.age_seconds != null) ? Math.floor(status.age_seconds) + 'с' : '?';
       return 'Runtime: не отвечает (' + staleAge + ')';
     }}
-    var parts = ['Runtime: активен (' + (status.mode || '?') + ')'];
+    var label = (status.activity === 'ai_cycle') ? 'анализирует рынок' : 'активен';
+    var parts = ['Runtime: ' + label + ' (' + (status.mode || '?') + ')'];
     if (status.open_paper_positions != null || status.open_real_positions != null) {{
       var paper = (status.open_paper_positions != null) ? status.open_paper_positions : '?';
       var real = (status.open_real_positions != null) ? status.open_real_positions : '?';

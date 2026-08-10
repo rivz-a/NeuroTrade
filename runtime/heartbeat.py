@@ -38,7 +38,9 @@ def is_heartbeat_stale(heartbeat: dict, max_age_seconds: float, now: float | Non
     return (now - last) > max_age_seconds
 
 
-def heartbeat_status(path: Path, max_age_seconds: float, now: float | None = None) -> dict:
+def heartbeat_status(
+    path: Path, max_age_seconds: float, now: float | None = None, *, busy_max_age_seconds: float | None = None
+) -> dict:
     """Normalized summary for UI/monitoring consumers (dashboard badge,
     /api/status) — one place to turn the raw heartbeat file into a
     tri-state "state" so callers never re-derive the ok/stale/unknown logic
@@ -48,6 +50,12 @@ def heartbeat_status(path: Path, max_age_seconds: float, now: float | None = Non
     runtime's first tick, or the file failed to parse) is kept distinct
     from "stale" (was alive, has since gone quiet) since they call for
     different UI treatment.
+
+    `busy_max_age_seconds`, when given, replaces `max_age_seconds` for a
+    heartbeat whose `activity` field is `"ai_cycle"` — an in-flight AI
+    analysis can legitimately take far longer than a normal 2s tick, and
+    without this every scheduled cycle would falsely read as "stale" for
+    however long the AI calls take.
     """
     now = now if now is not None else time.time()
     heartbeat = read_heartbeat(path)
@@ -56,7 +64,10 @@ def heartbeat_status(path: Path, max_age_seconds: float, now: float | None = Non
 
     last = heartbeat.get("last_heartbeat_at")
     age_seconds = (now - last) if last is not None else None
-    state = "stale" if is_heartbeat_stale(heartbeat, max_age_seconds, now=now) else "ok"
+    effective_max_age = max_age_seconds
+    if busy_max_age_seconds is not None and heartbeat.get("activity") == "ai_cycle":
+        effective_max_age = busy_max_age_seconds
+    state = "stale" if is_heartbeat_stale(heartbeat, effective_max_age, now=now) else "ok"
     return {
         "state": state,
         "age_seconds": age_seconds,
@@ -65,4 +76,5 @@ def heartbeat_status(path: Path, max_age_seconds: float, now: float | None = Non
         "open_paper_positions": heartbeat.get("open_paper_positions"),
         "open_real_positions": heartbeat.get("open_real_positions"),
         "last_error": heartbeat.get("last_error"),
+        "activity": heartbeat.get("activity"),
     }

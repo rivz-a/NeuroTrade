@@ -308,6 +308,27 @@ RUNTIME_LOCK_FILE = Path(__file__).resolve().parent / "runtime.lock"
 RUNTIME_HEARTBEAT_FILE = Path(__file__).resolve().parent / "runtime_heartbeat.json"
 RUNTIME_HEARTBEAT_STALE_SECONDS = float(os.getenv("RUNTIME_HEARTBEAT_STALE_SECONDS", "15"))
 
+# runtime/ai_cycle.py (Stage: online paper trading): how often the runtime
+# fetches fresh data, asks the AI, and — if the consensus is actionable —
+# opens a paper position from it. Defaults to this process's own trading
+# mode's prediction horizon (no point re-asking mid-horizon, before the
+# last prediction could even resolve). Skipped entirely (not just
+# rescheduled) while a pending/open PAPER order already exists for the
+# symbol — see TradingRuntime.run_once.
+RUNTIME_AI_CYCLE_INTERVAL_SECONDS = float(
+    os.getenv(
+        "RUNTIME_AI_CYCLE_INTERVAL_SECONDS",
+        str(PREDICTION_HORIZON_SECONDS.get(TRADING_MODE, PREDICTION_HORIZON_SECONDS["scalping"])),
+    )
+)
+# An AI cycle's 3 parallel model calls (up to AI_REQUEST_TIMEOUT each) plus
+# the rest of the pipeline can legitimately block run_once() far longer
+# than RUNTIME_HEARTBEAT_STALE_SECONDS — heartbeat_status() uses this wider
+# budget instead, but only while the last-written heartbeat's own
+# `activity` field says a cycle was in flight, so a genuine hang still
+# alerts using the normal (short) threshold once heartbeat writes stop.
+RUNTIME_HEARTBEAT_BUSY_STALE_SECONDS = float(os.getenv("RUNTIME_HEARTBEAT_BUSY_STALE_SECONDS", "150"))
+
 
 @dataclass(frozen=True)
 class AIModelConfig:

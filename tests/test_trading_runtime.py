@@ -17,9 +17,14 @@ import journal_db
 import market_data_engine
 import paper_trading
 import position_manager
+from runtime import ai_cycle
 from runtime.service import TradingRuntime
 
 NOW = 1_700_000_000.0
+
+
+def _noop_ai_cycle(conn, symbol, mode, *, now=None):
+    return ai_cycle.AICycleResult(ran=False, reason="test-default-noop")
 
 
 @pytest.fixture(autouse=True)
@@ -28,6 +33,12 @@ def _use_tmp_paths(monkeypatch, tmp_path):
     monkeypatch.setattr(config, "RUNTIME_HEARTBEAT_FILE", tmp_path / "heartbeat.json")
     monkeypatch.setattr(config, "RUNTIME_MODE", "PAPER")
     monkeypatch.setattr(config, "RUNTIME_MEDIUM_INTERVAL_SECONDS", 10.0)
+    monkeypatch.setattr(config, "RUNTIME_AI_CYCLE_INTERVAL_SECONDS", 1800.0)
+    # Every test gets a harmless no-op by default -- tests targeting the AI
+    # cycle itself override this explicitly, same convention as the other
+    # external calls (market_data_engine, paper_trading, execution_engine)
+    # this file always monkeypatches per-test.
+    monkeypatch.setattr(ai_cycle, "run_ai_cycle", _noop_ai_cycle)
 
 
 @pytest.fixture
@@ -161,6 +172,133 @@ def test_run_once_survives_process_tick_exception(conn, monkeypatch):
     runtime = TradingRuntime("ETHUSDT", conn=conn)
     result = runtime.run_once(now=NOW)
     assert any("process_tick failed" in e for e in result.errors)
+
+
+def test_run_once_runs_ai_cycle_on_first_tick_when_nothing_open(conn, monkeypatch):
+    monkeypatch.setattr(market_data_engine, "collect_snapshot", lambda symbol, now=None: _snapshot("GOOD"))
+    monkeypatch.setattr(paper_trading, "process_tick", lambda c, symbol, now=None: None)
+    calls = []
+
+    def _tracked(c, symbol, mode, *, now=None):
+        calls.append((symbol, mode))
+        return ai_cycle.AICycleResult(ran=True, trade_plan_id=1, paper_order_status="SKIPPED_NOT_ACTIONABLE")
+
+    monkeypatch.setattr(ai_cycle, "run_ai_cycle", _tracked)
+
+    runtime = TradingRuntime("ETHUSDT", conn=conn)
+    result = runtime.run_once(now=NOW)
+
+    assert calls == [("ETHUSDT", config.TRADING_MODE)]
+    assert result.ai_cycle_result.ran is True
+    assert result.ai_cycle_result.trade_plan_id == 1
+
+
+def test_run_once_skips_ai_cycle_when_open_paper_position_exists(conn, monkeypatch):
+    monkeypatch.setattr(market_data_engine, "collect_snapshot", lambda symbol, now=None: _snapshot("GOOD"))
+    monkeypatch.setattr(paper_trading, "process_tick", lambda c, symbol, now=None: None)
+    monkeypatch.setattr(
+        ai_cycle, "run_ai_cycle",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("ai_cycle should not run with an open PAPER position")),
+    )
+    journal_db.insert_position(
+        conn, symbol="ETHUSDT", side="LONG", source="PAPER", entry_price="100", quantity="1", now=NOW
+    )
+    conn.commit()
+
+    runtime = TradingRuntime("ETHUSDT", conn=conn)
+    result = runtime.run_once(now=NOW)
+    assert result.ai_cycle_result is None
+    assert result.errors == []
+
+
+def test_run_once_skips_ai_cycle_when_pending_paper_order_exists(conn, monkeypatch):
+    monkeypatch.setattr(market_data_engine, "collect_snapshot", lambda symbol, now=None: _snapshot("GOOD"))
+    monkeypatch.setattr(paper_trading, "process_tick", lambda c, symbol, now=None: None)
+    monkeypatch.setattr(
+        ai_cycle, "run_ai_cycle",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("ai_cycle should not run with a pending paper order")),
+    )
+    journal_db.insert_paper_order(
+        conn, symbol="ETHUSDT", side="LONG", order_type="LIMIT", quantity="1",
+        entry_from=100, entry_to=101, stop_loss=95, status="PENDING", now=NOW,
+    )
+    conn.commit()
+
+    runtime = TradingRuntime("ETHUSDT", conn=conn)
+    result = runtime.run_once(now=NOW)
+    assert result.ai_cycle_result is None
+
+
+def test_run_once_does_not_run_ai_cycle_in_monitor_only_mode(conn, monkeypatch):
+    monkeypatch.setattr(config, "RUNTIME_MODE", "MONITOR_ONLY")
+    monkeypatch.setattr(market_data_engine, "collect_snapshot", lambda symbol, now=None: _snapshot("GOOD"))
+    monkeypatch.setattr(execution_engine, "monitor", lambda c, symbol: None)
+    monkeypatch.setattr(
+        ai_cycle, "run_ai_cycle",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("ai_cycle should never run outside PAPER mode")),
+    )
+
+    runtime = TradingRuntime("ETHUSDT", conn=conn)
+    result = runtime.run_once(now=NOW)
+    assert result.ai_cycle_result is None
+
+
+def test_run_once_respects_ai_cycle_interval(conn, monkeypatch):
+    monkeypatch.setattr(config, "RUNTIME_AI_CYCLE_INTERVAL_SECONDS", 1800.0)
+    monkeypatch.setattr(market_data_engine, "collect_snapshot", lambda symbol, now=None: _snapshot("GOOD"))
+    monkeypatch.setattr(paper_trading, "process_tick", lambda c, symbol, now=None: None)
+    calls = []
+    monkeypatch.setattr(
+        ai_cycle, "run_ai_cycle",
+        lambda c, symbol, mode, *, now=None: calls.append(now) or ai_cycle.AICycleResult(ran=True),
+    )
+
+    runtime = TradingRuntime("ETHUSDT", conn=conn)
+    runtime.run_once(now=NOW)  # first tick always runs it (elapsed since epoch 0 is huge)
+    assert calls == [NOW]
+
+    runtime.run_once(now=NOW + 60)  # well within the 1800s interval
+    assert calls == [NOW]  # not called again
+
+    runtime.run_once(now=NOW + 1801)  # past the interval
+    assert calls == [NOW, NOW + 1801]
+
+
+def test_run_once_ai_cycle_writes_busy_heartbeat_before_running(conn, monkeypatch):
+    from runtime.heartbeat import read_heartbeat
+
+    monkeypatch.setattr(market_data_engine, "collect_snapshot", lambda symbol, now=None: _snapshot("GOOD"))
+    monkeypatch.setattr(paper_trading, "process_tick", lambda c, symbol, now=None: None)
+    seen_activity = []
+
+    def _check_heartbeat_mid_cycle(c, symbol, mode, *, now=None):
+        hb = read_heartbeat(config.RUNTIME_HEARTBEAT_FILE)
+        seen_activity.append(hb.get("activity") if hb else None)
+        return ai_cycle.AICycleResult(ran=True)
+
+    monkeypatch.setattr(ai_cycle, "run_ai_cycle", _check_heartbeat_mid_cycle)
+
+    runtime = TradingRuntime("ETHUSDT", conn=conn)
+    runtime.run_once(now=NOW)
+
+    assert seen_activity == ["ai_cycle"]
+    # the FINAL heartbeat (written after the cycle completes) no longer
+    # carries the in-flight marker
+    final_hb = read_heartbeat(config.RUNTIME_HEARTBEAT_FILE)
+    assert final_hb.get("activity") is None
+
+
+def test_run_once_survives_ai_cycle_exception(conn, monkeypatch):
+    monkeypatch.setattr(market_data_engine, "collect_snapshot", lambda symbol, now=None: _snapshot("GOOD"))
+    monkeypatch.setattr(paper_trading, "process_tick", lambda c, symbol, now=None: None)
+    monkeypatch.setattr(
+        ai_cycle, "run_ai_cycle", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom"))
+    )
+
+    runtime = TradingRuntime("ETHUSDT", conn=conn)
+    result = runtime.run_once(now=NOW)
+    assert any("ai_cycle failed" in e for e in result.errors)
+    assert result.ai_cycle_result is None
 
 
 def test_startup_recovery_logs_warning_on_discrepancy(conn, monkeypatch):
