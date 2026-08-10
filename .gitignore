@@ -18,3 +18,4 @@ kill_switch.flag
 runtime.lock
 runtime_heartbeat.json
 *.log
+backups/

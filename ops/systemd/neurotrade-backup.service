@@ -1,0 +1,9 @@
+[Unit]
+Description=NeuroTrade journal.db backup
+
+[Service]
+Type=oneshot
+User=deploy
+Group=deploy
+WorkingDirectory=/opt/neurotrade
+ExecStart=/opt/neurotrade/ops/backup.sh

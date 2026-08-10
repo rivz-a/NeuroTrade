@@ -75,6 +75,10 @@ def get_connection(db_path: Path | None = None) -> sqlite3.Connection:
     conn.execute("PRAGMA foreign_keys = ON")
     conn.execute("PRAGMA journal_mode = WAL")
     conn.execute(f"PRAGMA busy_timeout = {config.JOURNAL_DB_BUSY_TIMEOUT_MS}")
+    # NORMAL is the documented safe pairing for WAL (durable across app
+    # crashes; only a full OS/power failure could lose the last commit) and
+    # avoids the fsync-per-transaction cost of the FULL default.
+    conn.execute("PRAGMA synchronous = NORMAL")
     return conn
 
 

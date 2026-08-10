@@ -9,15 +9,18 @@ instead, for a human to inspect locally if something needs debugging.
 from __future__ import annotations
 
 import logging
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 _LOG_FILE = Path(__file__).resolve().parent / "neurotrade.log"
+_MAX_BYTES = 10 * 1024 * 1024
+_BACKUP_COUNT = 5
 
 logger = logging.getLogger("neurotrade")
 logger.setLevel(logging.INFO)
 
 if not logger.handlers:
-    _handler = logging.FileHandler(_LOG_FILE, encoding="utf-8")
+    _handler = RotatingFileHandler(_LOG_FILE, maxBytes=_MAX_BYTES, backupCount=_BACKUP_COUNT, encoding="utf-8")
     _handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
     logger.addHandler(_handler)
 

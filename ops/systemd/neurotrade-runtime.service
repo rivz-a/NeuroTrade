@@ -1,0 +1,18 @@
+[Unit]
+Description=NeuroTrade trading runtime (trading_runtime.py)
+After=network.target
+
+[Service]
+Type=simple
+User=deploy
+Group=deploy
+WorkingDirectory=/opt/neurotrade
+EnvironmentFile=/opt/neurotrade/.env
+ExecStart=/opt/neurotrade/venv/bin/python /opt/neurotrade/trading_runtime.py
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

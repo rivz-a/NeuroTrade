@@ -28,6 +28,7 @@ ever monitors positions/orders that already exist.
 
 from __future__ import annotations
 
+import signal
 import time
 from dataclasses import dataclass, field
 
@@ -39,6 +40,18 @@ import market_data_engine
 import paper_trading
 import position_manager
 from runtime import heartbeat, locking
+
+
+class _ShutdownRequested(Exception):
+    """Raised from the SIGTERM handler so `systemctl stop` unwinds the run()
+    loop through the same clean-shutdown path as Ctrl+C (KeyboardInterrupt),
+    instead of Python's default SIGTERM behavior of killing the process
+    immediately without running any `finally` block.
+    """
+
+
+def _raise_shutdown(signum, frame) -> None:
+    raise _ShutdownRequested()
 
 
 @dataclass(frozen=True)
@@ -160,18 +173,21 @@ class TradingRuntime:
     # -----------------------------------------------------------------
 
     def run(self) -> None:
+        previous_sigterm_handler = signal.signal(signal.SIGTERM, _raise_shutdown)
         self._lock_handle = locking.acquire_lock(config.RUNTIME_LOCK_FILE)
         try:
             self._startup_recovery()
             while True:
                 self.run_once()
                 time.sleep(config.RUNTIME_FAST_INTERVAL_SECONDS)
-        except KeyboardInterrupt:
+        except (KeyboardInterrupt, _ShutdownRequested) as exc:
+            reason = "KeyboardInterrupt" if isinstance(exc, KeyboardInterrupt) else "SIGTERM"
             journal_db.log_event(
                 self._conn, level="INFO", event_code="RUNTIME_SHUTDOWN", source_module="trading_runtime",
-                symbol=self.symbol, message="trading_runtime stopped (KeyboardInterrupt).",
+                symbol=self.symbol, message=f"trading_runtime stopped ({reason}).",
             )
             self._conn.commit()
         finally:
+            signal.signal(signal.SIGTERM, previous_sigterm_handler)
             locking.release_lock(self._lock_handle)
             self._conn.close()
