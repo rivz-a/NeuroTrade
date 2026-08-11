@@ -183,6 +183,20 @@ def _load_cache() -> dict | None:
         return None
 
 
+def _is_usable_cache(cached: dict | None) -> bool:
+    """dashboard_cache.pkl is written by TWO separate processes now
+    (this one, and trading_runtime.py's ai_cycle via dashboard_state.py) —
+    a reader can no longer assume it only ever sees its own well-formed
+    writes. Guards render()/build_dashboard() (which index straight into
+    snapshot["timestamp"]) against a torn/mismatched read from the other
+    process instead of crash-looping the whole service on one bad read.
+    """
+    if not cached or not cached.get("results_by_mode"):
+        return False
+    snapshot = cached.get("snapshot")
+    return isinstance(snapshot, dict) and "timestamp" in snapshot
+
+
 def _maybe_reload_from_disk(state: _State) -> None:
     """Picks up any fresher per-mode results trading_runtime.py's ai_cycle
     (a SEPARATE process) wrote to the shared on-disk cache since our last
@@ -200,7 +214,7 @@ def _maybe_reload_from_disk(state: _State) -> None:
         if mtime <= state.cache_loaded_at:
             return
         cached = _load_cache()
-        if cached is None:
+        if not _is_usable_cache(cached):
             return
         cached_updated_at = cached.get("last_updated_at") or {}
         changed = False
@@ -210,8 +224,7 @@ def _maybe_reload_from_disk(state: _State) -> None:
             if their_ts is not None and (our_ts is None or their_ts > our_ts):
                 state.results_by_mode[mode] = results
                 state.last_updated_at[mode] = their_ts
-                if cached.get("snapshot") is not None:
-                    state.snapshot = cached["snapshot"]
+                state.snapshot = cached["snapshot"]
                 changed = True
         state.cache_loaded_at = mtime
         if changed:
@@ -578,7 +591,7 @@ def run_server(
         state.results_by_mode = dict(initial_results_by_mode)
         state.active_mode = initial_mode
         state.last_html = build_dashboard(initial_snapshot, state.results_by_mode, initial_mode)
-    elif cached is not None and cached.get("results_by_mode"):
+    elif _is_usable_cache(cached):
         say("[cyan]Восстанавливаю последнее состояние из кеша — без новых запросов к BingX/AI...[/cyan]")
         state.snapshot = cached["snapshot"]
         state.results_by_mode = cached["results_by_mode"]
