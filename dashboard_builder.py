@@ -2237,6 +2237,14 @@ def build_dashboard(
         }});
       }})
       .then(function (result) {{
+        if (result.ok && result.data && result.data.queued) {{
+          // TRADING_MODE's own runtime cycle will produce this, not us --
+          // the periodic /api/status poll below reloads the page once it
+          // lands, no separate AI call was made here.
+          status.textContent = 'Анализ этого режима ведёт runtime по расписанию — запросил внеочередной цикл, ' +
+            'страница обновится сама, когда он завершится.';
+          return;
+        }}
         if (result.ok && result.data && result.data.ok) {{
           location.reload();
           return;
@@ -2472,6 +2480,8 @@ def build_dashboard(
   setInterval(checkStaleSignals, 30000);
 
   var RUNTIME_HEARTBEAT_COLORS = {{ ok: '#0ca30c', stale: '#d03b3b' }};
+  var TRADING_MODE = {config.TRADING_MODE!r};
+  var tradingModeBaselineUpdatedAt = null;
 
   function formatRuntimeHeartbeat(status) {{
     if (!status || status.state === 'unknown') return 'Runtime: нет данных';
@@ -2491,18 +2501,32 @@ def build_dashboard(
   }}
 
   function pollRuntimeHeartbeat() {{
-    var badge = document.getElementById('runtime-heartbeat');
-    var text = document.getElementById('runtime-heartbeat-text');
-    if (!badge || !text) return;
     fetch('/api/status', {{ cache: 'no-store' }})
       .then(function (resp) {{ return resp.json(); }})
       .then(function (data) {{
-        var status = data && data.runtime;
-        text.textContent = formatRuntimeHeartbeat(status);
-        var dot = badge.querySelector('.freshness-dot');
-        var color = (status && RUNTIME_HEARTBEAT_COLORS[status.state]) || 'var(--text-muted)';
-        if (dot) dot.style.setProperty('--status-color', color);
-        badge.dataset.state = (status && status.state) || 'unknown';
+        var badge = document.getElementById('runtime-heartbeat');
+        var text = document.getElementById('runtime-heartbeat-text');
+        if (badge && text) {{
+          var status = data && data.runtime;
+          text.textContent = formatRuntimeHeartbeat(status);
+          var dot = badge.querySelector('.freshness-dot');
+          var color = (status && RUNTIME_HEARTBEAT_COLORS[status.state]) || 'var(--text-muted)';
+          if (dot) dot.style.setProperty('--status-color', color);
+          badge.dataset.state = (status && status.state) || 'unknown';
+        }}
+
+        // The runtime's own scheduled AI cycle (not this page) produced
+        // TRADING_MODE's results -- once its updated_at moves past what
+        // was true when this page loaded, reload to show them, same as a
+        // manual "Обновить" already does on success.
+        var modeInfo = data && data.modes && data.modes[TRADING_MODE];
+        if (modeInfo && modeInfo.updated_at != null) {{
+          if (tradingModeBaselineUpdatedAt === null) {{
+            tradingModeBaselineUpdatedAt = modeInfo.updated_at;
+          }} else if (modeInfo.updated_at > tradingModeBaselineUpdatedAt && !dashboardRefreshing) {{
+            location.reload();
+          }}
+        }}
       }})
       .catch(function () {{ /* dashboard server itself unreachable -- leave last-known state shown */ }});
   }}

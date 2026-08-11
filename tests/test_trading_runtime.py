@@ -34,6 +34,7 @@ def _use_tmp_paths(monkeypatch, tmp_path):
     monkeypatch.setattr(config, "RUNTIME_MODE", "PAPER")
     monkeypatch.setattr(config, "RUNTIME_MEDIUM_INTERVAL_SECONDS", 10.0)
     monkeypatch.setattr(config, "RUNTIME_AI_CYCLE_INTERVAL_SECONDS", 1800.0)
+    monkeypatch.setattr(config, "RUNTIME_AI_CYCLE_TRIGGER_FILE", tmp_path / "ai_cycle_trigger.flag")
     # Every test gets a harmless no-op by default -- tests targeting the AI
     # cycle itself override this explicitly, same convention as the other
     # external calls (market_data_engine, paper_trading, execution_engine)
@@ -299,6 +300,61 @@ def test_run_once_survives_ai_cycle_exception(conn, monkeypatch):
     result = runtime.run_once(now=NOW)
     assert any("ai_cycle failed" in e for e in result.errors)
     assert result.ai_cycle_result is None
+
+
+def test_run_once_trigger_file_bypasses_the_interval(conn, monkeypatch):
+    monkeypatch.setattr(config, "RUNTIME_AI_CYCLE_INTERVAL_SECONDS", 1800.0)
+    monkeypatch.setattr(market_data_engine, "collect_snapshot", lambda symbol, now=None: _snapshot("GOOD"))
+    monkeypatch.setattr(paper_trading, "process_tick", lambda c, symbol, now=None: None)
+    calls = []
+    monkeypatch.setattr(
+        ai_cycle, "run_ai_cycle",
+        lambda c, symbol, mode, *, now=None: calls.append(now) or ai_cycle.AICycleResult(ran=True),
+    )
+
+    runtime = TradingRuntime("ETHUSDT", conn=conn)
+    runtime.run_once(now=NOW)  # first tick always runs it regardless
+    assert calls == [NOW]
+
+    runtime.run_once(now=NOW + 60)  # well within the 1800s interval, no trigger
+    assert calls == [NOW]
+
+    config.RUNTIME_AI_CYCLE_TRIGGER_FILE.touch()
+    runtime.run_once(now=NOW + 120)  # still within the interval, but triggered
+    assert calls == [NOW, NOW + 120]
+
+
+def test_run_once_trigger_file_is_consumed_after_use(conn, monkeypatch):
+    monkeypatch.setattr(market_data_engine, "collect_snapshot", lambda symbol, now=None: _snapshot("GOOD"))
+    monkeypatch.setattr(paper_trading, "process_tick", lambda c, symbol, now=None: None)
+    monkeypatch.setattr(ai_cycle, "run_ai_cycle", lambda *a, **k: ai_cycle.AICycleResult(ran=True))
+
+    config.RUNTIME_AI_CYCLE_TRIGGER_FILE.touch()
+    runtime = TradingRuntime("ETHUSDT", conn=conn)
+    runtime.run_once(now=NOW)
+
+    assert not config.RUNTIME_AI_CYCLE_TRIGGER_FILE.exists()
+
+
+def test_run_once_trigger_file_left_alone_when_position_open(conn, monkeypatch):
+    monkeypatch.setattr(market_data_engine, "collect_snapshot", lambda symbol, now=None: _snapshot("GOOD"))
+    monkeypatch.setattr(paper_trading, "process_tick", lambda c, symbol, now=None: None)
+    monkeypatch.setattr(
+        ai_cycle, "run_ai_cycle",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("ai_cycle should not run with an open PAPER position")),
+    )
+    journal_db.insert_position(
+        conn, symbol="ETHUSDT", side="LONG", source="PAPER", entry_price="100", quantity="1", now=NOW
+    )
+    conn.commit()
+
+    config.RUNTIME_AI_CYCLE_TRIGGER_FILE.touch()
+    runtime = TradingRuntime("ETHUSDT", conn=conn)
+    runtime.run_once(now=NOW)
+
+    # still queued -- the request stays pending until a position frees up,
+    # it isn't silently dropped just because now wasn't a good moment.
+    assert config.RUNTIME_AI_CYCLE_TRIGGER_FILE.exists()
 
 
 def test_startup_recovery_logs_warning_on_discrepancy(conn, monkeypatch):

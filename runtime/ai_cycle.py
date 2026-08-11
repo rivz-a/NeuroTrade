@@ -29,6 +29,7 @@ from dataclasses import dataclass
 
 import ai_client
 import config
+import dashboard_state
 import feature_engine
 import journal_db
 import market_data_engine
@@ -80,6 +81,7 @@ def run_ai_cycle(conn, symbol: str, mode: str, *, now: float | None = None) -> A
         return AICycleResult(ran=False, reason=str(exc))
 
     prediction_tracker.record_results(mode, results, snapshot["current_price"], bingx_symbol)
+    dashboard_state.save_mode_results(mode, results, snapshot)
 
     snap_id = journal_db.insert_market_snapshot(conn, engine_snapshot)
     fs_id = journal_db.insert_feature_snapshot(conn, features, market_snapshot_id=snap_id)

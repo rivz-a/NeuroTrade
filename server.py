@@ -19,6 +19,7 @@ Or via main.py:  python main.py --serve
 from __future__ import annotations
 
 import json
+import os
 import pickle
 import threading
 import time
@@ -65,6 +66,7 @@ class _State:
         self.last_html = ""
         self.last_refresh_finished_at: dict[str, float] = {}
         self.last_updated_at: dict[str, float] = {}
+        self.cache_loaded_at: float = 0.0
 
 
 def _rebuild_and_persist_html(state: _State, default_mode: str) -> None:
@@ -146,6 +148,11 @@ def _save_cache(state: _State) -> None:
     """Persist state to disk so a later `python server.py` restart (e.g. after
     a code change) can reload it instead of re-fetching BingX/AI from scratch.
     Best-effort — a cache write failure should never break a live request.
+
+    Atomic write (temp file + os.replace, same as dashboard_state.py) —
+    this file is no longer server.py's alone: trading_runtime.py's ai_cycle
+    (a separate process) also reads and writes it now, so a reader must
+    never observe a half-written file from either side.
     """
     try:
         payload = {
@@ -154,8 +161,10 @@ def _save_cache(state: _State) -> None:
             "active_mode": state.active_mode,
             "last_updated_at": state.last_updated_at,
         }
-        with open(config.DASHBOARD_CACHE_FILE, "wb") as f:
+        tmp_path = config.DASHBOARD_CACHE_FILE.with_suffix(config.DASHBOARD_CACHE_FILE.suffix + ".tmp")
+        with open(tmp_path, "wb") as f:
             pickle.dump(payload, f)
+        os.replace(tmp_path, config.DASHBOARD_CACHE_FILE)
     except Exception as exc:  # pragma: no cover - best-effort cache only
         print(f"Не удалось сохранить кеш {config.DASHBOARD_CACHE_FILE}: {exc}")
 
@@ -172,6 +181,41 @@ def _load_cache() -> dict | None:
     except Exception as exc:
         print(f"Не удалось прочитать кеш {config.DASHBOARD_CACHE_FILE}: {exc}")
         return None
+
+
+def _maybe_reload_from_disk(state: _State) -> None:
+    """Picks up any fresher per-mode results trading_runtime.py's ai_cycle
+    (a SEPARATE process) wrote to the shared on-disk cache since our last
+    read — see dashboard_state.py — so the dashboard reflects the
+    runtime's scheduled (already-paid-for) AI calls automatically instead
+    of only ever updating on this process's own "Обновить" click. Cheap on
+    the common case (one stat() call); called at the top of every "/" and
+    /api/status request.
+    """
+    try:
+        mtime = config.DASHBOARD_CACHE_FILE.stat().st_mtime
+    except OSError:
+        return
+    with state.lock:
+        if mtime <= state.cache_loaded_at:
+            return
+        cached = _load_cache()
+        if cached is None:
+            return
+        cached_updated_at = cached.get("last_updated_at") or {}
+        changed = False
+        for mode, results in (cached.get("results_by_mode") or {}).items():
+            their_ts = cached_updated_at.get(mode)
+            our_ts = state.last_updated_at.get(mode)
+            if their_ts is not None and (our_ts is None or their_ts > our_ts):
+                state.results_by_mode[mode] = results
+                state.last_updated_at[mode] = their_ts
+                if cached.get("snapshot") is not None:
+                    state.snapshot = cached["snapshot"]
+                changed = True
+        state.cache_loaded_at = mtime
+        if changed:
+            _rebuild_and_persist_html(state, state.active_mode)
 
 
 def _status_snapshot(state: _State) -> dict:
@@ -276,6 +320,7 @@ def _make_handler(state: _State):
             parsed = urlparse(self.path)
 
             if parsed.path in ("/", "/dashboard.html"):
+                _maybe_reload_from_disk(state)
                 with state.lock:
                     html_str = state.last_html
                 self._send_html(html_str)
@@ -284,6 +329,7 @@ def _make_handler(state: _State):
             if parsed.path == "/api/status":
                 # Read-only — poll this to check progress, never /api/refresh
                 # (that one has a side effect: it starts a real AI call).
+                _maybe_reload_from_disk(state)
                 self._send_json({"ok": True, **_status_snapshot(state)})
                 return
 
@@ -326,6 +372,19 @@ def _make_handler(state: _State):
                     return
                 if model_label is not None and model_label not in {m.label for m in config.AI_MODELS}:
                     self._send_json({"ok": False, "error": f"Неизвестная модель: {model_label}"}, status=400)
+                    return
+
+                # trading_runtime.py's ai_cycle already pays for a full,
+                # all-model analysis of THIS mode on its own schedule
+                # (RUNTIME_MODE=PAPER) — a whole-mode refresh here would be
+                # a second, independent AI call for near-duplicate results.
+                # Queue an out-of-schedule runtime cycle instead. Per-model
+                # refresh (model_label set) is unaffected — that's a
+                # different, smaller action for testing/tuning one model,
+                # not something the runtime's cycle produces at all.
+                if model_label is None and mode == config.TRADING_MODE and config.RUNTIME_MODE == "PAPER":
+                    config.RUNTIME_AI_CYCLE_TRIGGER_FILE.touch()
+                    self._send_json({"ok": True, "queued": True, "mode": mode})
                     return
 
                 # Cooldown is scoped per (mode, model) so refreshing one card

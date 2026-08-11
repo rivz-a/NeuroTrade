@@ -329,6 +329,14 @@ RUNTIME_AI_CYCLE_INTERVAL_SECONDS = float(
 # alerts using the normal (short) threshold once heartbeat writes stop.
 RUNTIME_HEARTBEAT_BUSY_STALE_SECONDS = float(os.getenv("RUNTIME_HEARTBEAT_BUSY_STALE_SECONDS", "150"))
 
+# Dashboard's "Обновить" button for TRADING_MODE touches this file instead
+# of paying for its own independent AI call — trading_runtime.py already
+# pays for that mode's analysis on its own schedule, so a second, separate
+# call would just be the same money spent twice for near-duplicate
+# results. TradingRuntime.run_once() treats this file's mere existence as
+# "run the AI cycle now, interval or not" and deletes it once consumed.
+RUNTIME_AI_CYCLE_TRIGGER_FILE = Path(__file__).resolve().parent / "ai_cycle_trigger.flag"
+
 
 @dataclass(frozen=True)
 class AIModelConfig:

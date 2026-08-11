@@ -27,7 +27,13 @@ counter, which would drift if a tick ever takes longer than usual):
     (without consuming/advancing the interval) while a pending/open PAPER
     order already exists for the symbol, so this app never stacks more
     than one paper position at a time the same way the plan for eventual
-    real trading insists on ("один ордер одновременно").
+    real trading insists on ("один ордер одновременно"). Also fires
+    immediately, interval or not, when config.RUNTIME_AI_CYCLE_TRIGGER_FILE
+    exists — server.py's dashboard "Обновить" button for this trading mode
+    touches that file instead of paying for its own separate AI call, so
+    the runtime (which already pays for this mode's analysis on its own
+    schedule) stays the single source of truth instead of two independent
+    paid AI-call paths existing side by side.
 
 execution_engine.confirm_and_execute (placing a NEW real order) is never
 called from here — that stays a separate, manual action. This runtime only
@@ -161,9 +167,16 @@ class TradingRuntime:
         open_real = journal_db.get_open_positions(self._conn, self.symbol, source="REAL")
 
         ai_cycle_result: ai_cycle.AICycleResult | None = None
-        if config.RUNTIME_MODE == "PAPER" and now - self._last_ai_cycle_run >= config.RUNTIME_AI_CYCLE_INTERVAL_SECONDS:
+        triggered = config.RUNTIME_MODE == "PAPER" and config.RUNTIME_AI_CYCLE_TRIGGER_FILE.exists()
+        interval_elapsed = now - self._last_ai_cycle_run >= config.RUNTIME_AI_CYCLE_INTERVAL_SECONDS
+        if config.RUNTIME_MODE == "PAPER" and (triggered or interval_elapsed):
             pending_paper_orders = journal_db.get_pending_paper_orders(self._conn, self.symbol)
             if not pending_paper_orders and not open_paper:
+                if triggered:
+                    try:
+                        config.RUNTIME_AI_CYCLE_TRIGGER_FILE.unlink()
+                    except OSError:
+                        pass
                 self._last_ai_cycle_run = now
                 # An AI cycle can block for up to ~AI_REQUEST_TIMEOUT seconds
                 # (all 3 models run in parallel, but that's still far past
