@@ -36,6 +36,15 @@ from trade_validator import ValidationIssue, ValidationResult
 _SLOT_COLORS_LIGHT = ["#2a78d6", "#4a3aa7", "#1baf7a"]  # blue, violet, aqua
 _SLOT_COLORS_DARK = ["#3987e5", "#9085e9", "#199e70"]
 
+# One-line style summary shown next to each mode's name on the toggle —
+# same numbers config.py's PREDICTION_HORIZON_SECONDS already encodes
+# (scalping 30 мин, swing 8 часов), just spelled out for a human glancing
+# at the page instead of the .env file.
+_MODE_CHARACTERISTICS = {
+    "scalping": "узкие стопы по 1m/5m, вход и выход в течение минут",
+    "swing": "стопы/цели по структуре 15m/1h, удержание часы-сутки",
+}
+
 _STATUS = {
     "LONG": {"icon": "▲", "label": "LONG", "light": "#0ca30c", "dark": "#0ca30c"},
     "SHORT": {"icon": "▼", "label": "SHORT", "light": "#d03b3b", "dark": "#d03b3b"},
@@ -1203,7 +1212,8 @@ def _mode_toggle_and_grids(
         toggle_buttons.append(
             f'<button type="button" class="mode-toggle-btn{" active" if is_active else ""}" '
             f'data-mode="{html.escape(mode)}" onclick="setDashboardMode(\'{mode}\')" '
-            f'role="tab" aria-selected="{"true" if is_active else "false"}">'
+            f'role="tab" aria-selected="{"true" if is_active else "false"}" '
+            f'title="{html.escape(_MODE_CHARACTERISTICS.get(mode, ""))}">'
             f'{html.escape(MODE_LABELS[mode])} '
             f'<span class="toggle-count">{ok_count}/{len(results)}</span>'
             "</button>"
@@ -1252,7 +1262,18 @@ def _mode_toggle_and_grids(
             f'style="display: {"block" if is_active else "none"}">{_paper_trading_panel(mode)}</div>'
         )
 
-    toggle_html = f'<div class="mode-toggle" role="tablist" aria-label="Стиль анализа">{"".join(toggle_buttons)}</div>'
+    legend_parts = [
+        f"<strong>{html.escape(MODE_LABELS[m])}</strong> — {html.escape(_MODE_CHARACTERISTICS[m])}"
+        for m in modes
+        if m in _MODE_CHARACTERISTICS
+    ]
+    legend_html = (
+        f'<div class="mode-toggle-legend">{" &middot; ".join(legend_parts)}</div>' if legend_parts else ""
+    )
+    toggle_html = (
+        f'<div class="mode-toggle" role="tablist" aria-label="Стиль анализа">{"".join(toggle_buttons)}</div>'
+        f"{legend_html}"
+    )
     return (
         toggle_html,
         "".join(grids),
@@ -1765,8 +1786,15 @@ def build_dashboard(
   }}
   .mode-toggle-row {{
     display: flex;
-    justify-content: center;
+    flex-direction: column;
+    align-items: center;
+    gap: 6px;
     margin-bottom: 20px;
+  }}
+  .mode-toggle-legend {{
+    font-size: 12px;
+    color: var(--text-muted);
+    text-align: center;
   }}
   .mode-toggle {{
     display: inline-flex;
