@@ -36,7 +36,7 @@ import prediction_tracker
 import report_builder
 import risk_settings_store
 from ai_client import AIAnalysisResult
-from dashboard_builder import build_dashboard
+from dashboard_builder import _paper_trading_panel, build_dashboard
 from market_data import fetch_snapshot
 from report_builder import MODE_LABELS, build_report
 from risk_manager import PositionCalculator, TakeProfitTarget, TradeScenario
@@ -285,6 +285,16 @@ def _make_handler(state: _State):
                 # Read-only — poll this to check progress, never /api/refresh
                 # (that one has a side effect: it starts a real AI call).
                 self._send_json({"ok": True, **_status_snapshot(state)})
+                return
+
+            if parsed.path == "/api/paper-trading-stats":
+                # Read-only local journal_db query, no BingX/AI calls — safe
+                # to poll on an interval so the panel reflects trading_runtime.py's
+                # background activity without waiting for the next manual
+                # "Обновить" (which is what actually rebuilds state.last_html).
+                self._send_json(
+                    {"ok": True, "panels": {mode: _paper_trading_panel(mode) for mode in ("scalping", "swing")}}
+                )
                 return
 
             if parsed.path == "/api/risk-settings":

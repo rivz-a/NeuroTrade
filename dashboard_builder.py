@@ -1248,6 +1248,7 @@ def _mode_toggle_and_grids(
 
         paper_trading_panels.append(
             f'<div class="mode-accuracy" data-mode="{html.escape(mode)}" '
+            f'id="paper-trading-panel-{html.escape(mode)}" '
             f'style="display: {"block" if is_active else "none"}">{_paper_trading_panel(mode)}</div>'
         )
 
@@ -2506,6 +2507,21 @@ def build_dashboard(
       .catch(function () {{ /* dashboard server itself unreachable -- leave last-known state shown */ }});
   }}
   setInterval(pollRuntimeHeartbeat, 5000);
+
+  function pollPaperTradingStats() {{
+    fetch('/api/paper-trading-stats', {{ cache: 'no-store' }})
+      .then(function (resp) {{ return resp.json(); }})
+      .then(function (data) {{
+        if (!data || !data.ok || !data.panels) return;
+        ['scalping', 'swing'].forEach(function (mode) {{
+          var el = document.getElementById('paper-trading-panel-' + mode);
+          if (el && data.panels[mode] != null) el.innerHTML = data.panels[mode];
+        }});
+      }})
+      .catch(function () {{ /* dashboard server itself unreachable -- leave last-known content shown */ }});
+  }}
+  pollPaperTradingStats();
+  setInterval(pollPaperTradingStats, 60000);
 </script>
 </body>
 </html>
