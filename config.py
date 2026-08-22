@@ -144,7 +144,7 @@ MIN_SAMPLE_FOR_STATS = int(os.getenv("MIN_SAMPLE_FOR_STATS", "3"))
 # which underlying provider they proxy to.
 AI_API_KEY = os.getenv("AI_API_KEY", "").strip()
 AI_BASE_URL = os.getenv("AI_BASE_URL", "https://apinet.cloud/v1").strip()
-AI_MODEL = os.getenv("AI_MODEL", "gpt-5").strip()
+AI_MODEL = os.getenv("AI_MODEL", "gpt-5.1-all").strip()
 AI_LABEL = os.getenv("AI_LABEL", "NeuroTrade-gpt").strip()
 
 AI2_API_KEY = os.getenv("AI2_API_KEY", "").strip()
@@ -152,7 +152,7 @@ AI2_BASE_URL = os.getenv("AI2_BASE_URL", AI_BASE_URL).strip()
 AI2_MODEL = os.getenv("AI2_MODEL", "claude-opus-5").strip()
 AI2_LABEL = os.getenv("AI2_LABEL", "NeuroTrade-claude").strip()
 
-AI_REQUEST_TIMEOUT = float(os.getenv("AI_REQUEST_TIMEOUT", "90"))
+AI_REQUEST_TIMEOUT = float(os.getenv("AI_REQUEST_TIMEOUT", "180"))
 AI_ANALYSIS_FILE = Path(__file__).resolve().parent / "ai_analysis.txt"
 AI_DASHBOARD_FILE = Path(__file__).resolve().parent / "dashboard.html"
 
@@ -316,13 +316,13 @@ RUNTIME_AI_CYCLE_INTERVAL_SECONDS = float(
         str(PREDICTION_HORIZON_SECONDS.get(TRADING_MODE, PREDICTION_HORIZON_SECONDS["scalping"])),
     )
 )
-# An AI cycle's 3 parallel model calls (up to AI_REQUEST_TIMEOUT each) plus
+# An AI cycle's 2 parallel model calls (up to AI_REQUEST_TIMEOUT each) plus
 # the rest of the pipeline can legitimately block run_once() far longer
 # than RUNTIME_HEARTBEAT_STALE_SECONDS — heartbeat_status() uses this wider
 # budget instead, but only while the last-written heartbeat's own
 # `activity` field says a cycle was in flight, so a genuine hang still
 # alerts using the normal (short) threshold once heartbeat writes stop.
-RUNTIME_HEARTBEAT_BUSY_STALE_SECONDS = float(os.getenv("RUNTIME_HEARTBEAT_BUSY_STALE_SECONDS", "150"))
+RUNTIME_HEARTBEAT_BUSY_STALE_SECONDS = float(os.getenv("RUNTIME_HEARTBEAT_BUSY_STALE_SECONDS", "240"))
 
 # Dashboard's "Обновить" button for TRADING_MODE touches this file instead
 # of paying for its own independent AI call — trading_runtime.py already

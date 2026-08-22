@@ -124,7 +124,7 @@ FUNDING_HISTORY_LIMIT=5
 
 AI_API_KEY=
 AI_BASE_URL=https://apinet.cloud/v1
-AI_MODEL=gpt-5
+AI_MODEL=gpt-5.1-all
 AI_LABEL=NeuroTrade-gpt
 
 AI2_API_KEY=
@@ -132,7 +132,7 @@ AI2_BASE_URL=https://apinet.cloud/v1
 AI2_MODEL=claude-opus-5
 AI2_LABEL=NeuroTrade-claude
 
-AI_REQUEST_TIMEOUT=90
+AI_REQUEST_TIMEOUT=180
 
 DASHBOARD_HOST=127.0.0.1
 DASHBOARD_PORT=47913
@@ -587,7 +587,7 @@ Open interest: 519053383.00
 
 После этого блока (если не передан `--no-ai`) в терминал выводится ответ
 каждой настроенной AI-модели под своим заголовком (например
-`NeuroTrade-gpt (gpt-5)`), все ответы сохраняются в `ai_analysis.txt`, а
+`NeuroTrade-gpt (gpt-5.1-all)`), все ответы сохраняются в `ai_analysis.txt`, а
 сравнение — в `dashboard.html`. Именно в ответах AI будет сигнал
 LONG/SHORT/WAIT, уровни входа, stop loss, take profit 1/2/3, вероятность
 сценария и риски, как это описано в задаче для AI внутри отчёта.
