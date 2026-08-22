@@ -1054,7 +1054,7 @@ def _accuracy_panel(mode: str) -> str:
         )
 
     order = _label_order()
-    labels = sorted(stats.keys(), key=lambda label: (order.index(label) if label in order else 99, label))
+    labels = sorted((label for label in stats.keys() if label in order), key=order.index)
     rows_html = "".join(_accuracy_row(label, stats[label]) for label in labels)
 
     return f"""
@@ -1161,7 +1161,7 @@ def _paper_trading_panel(mode: str) -> str:
         )
 
     order = _label_order()
-    labels = sorted(stats.by_model.keys(), key=lambda label: (order.index(label) if label in order else 99, label))
+    labels = sorted((label for label in stats.by_model.keys() if label in order), key=order.index)
     rows_html = "".join(_paper_trading_row(label, stats.by_model[label]) for label in labels)
 
     return f"""
