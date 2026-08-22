@@ -305,8 +305,8 @@ def analyze_modes(
     configured = [m for m in models if m.api_key]
     if not configured:
         raise AIConfigError(
-            "Ни для одной модели не задан API-ключ в .env (AI_API_KEY / AI2_API_KEY / "
-            "AI3_API_KEY). Укажите хотя бы один ключ или запустите с флагом --no-ai."
+            "Ни для одной модели не задан API-ключ в .env (AI_API_KEY / "
+            "AI2_API_KEY). Укажите хотя бы один ключ или запустите с флагом --no-ai."
         )
 
     tasks = [

@@ -137,25 +137,20 @@ TRADING_SLIPPAGE_PCT = float(os.getenv("TRADING_SLIPPAGE_PCT", "0.0002"))  # 0.0
 OUTCOME_KLINE_INTERVAL = os.getenv("OUTCOME_KLINE_INTERVAL", "1m").strip()
 MIN_SAMPLE_FOR_STATS = int(os.getenv("MIN_SAMPLE_FOR_STATS", "3"))
 
-# AI analysis (optional): up to 3 OpenAI-compatible chat-completions APIs used
+# AI analysis (optional): up to 2 OpenAI-compatible chat-completions APIs used
 # to analyze the market snapshot automatically and compare their signals side
 # by side. Models with no API key set are skipped; the whole step is skipped
-# with --no-ai. All 3 share the same request/response contract regardless of
+# with --no-ai. Both share the same request/response contract regardless of
 # which underlying provider they proxy to.
 AI_API_KEY = os.getenv("AI_API_KEY", "").strip()
 AI_BASE_URL = os.getenv("AI_BASE_URL", "https://apinet.cloud/v1").strip()
-AI_MODEL = os.getenv("AI_MODEL", "gpt-4o-mini").strip()
-AI_LABEL = os.getenv("AI_LABEL", "GPT-4o mini").strip()
+AI_MODEL = os.getenv("AI_MODEL", "gpt-5").strip()
+AI_LABEL = os.getenv("AI_LABEL", "NeuroTrade-gpt").strip()
 
 AI2_API_KEY = os.getenv("AI2_API_KEY", "").strip()
 AI2_BASE_URL = os.getenv("AI2_BASE_URL", AI_BASE_URL).strip()
-AI2_MODEL = os.getenv("AI2_MODEL", "claude-sonnet-5").strip()
-AI2_LABEL = os.getenv("AI2_LABEL", "Claude Sonnet 5").strip()
-
-AI3_API_KEY = os.getenv("AI3_API_KEY", "").strip()
-AI3_BASE_URL = os.getenv("AI3_BASE_URL", AI_BASE_URL).strip()
-AI3_MODEL = os.getenv("AI3_MODEL", "gemini-2.5-pro").strip()
-AI3_LABEL = os.getenv("AI3_LABEL", "Gemini 2.5 Pro").strip()
+AI2_MODEL = os.getenv("AI2_MODEL", "claude-opus-5").strip()
+AI2_LABEL = os.getenv("AI2_LABEL", "NeuroTrade-claude").strip()
 
 AI_REQUEST_TIMEOUT = float(os.getenv("AI_REQUEST_TIMEOUT", "90"))
 AI_ANALYSIS_FILE = Path(__file__).resolve().parent / "ai_analysis.txt"
@@ -349,7 +344,6 @@ class AIModelConfig:
 AI_MODELS: list[AIModelConfig] = [
     AIModelConfig(AI_LABEL, AI_API_KEY, AI_BASE_URL, AI_MODEL),
     AIModelConfig(AI2_LABEL, AI2_API_KEY, AI2_BASE_URL, AI2_MODEL),
-    AIModelConfig(AI3_LABEL, AI3_API_KEY, AI3_BASE_URL, AI3_MODEL),
 ]
 
 

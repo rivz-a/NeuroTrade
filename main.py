@@ -2,7 +2,7 @@
 
 Fetches public ETHUSDT market data from BingX, computes indicators, and
 builds a plain-text report. By default the report is then sent in parallel
-to up to 3 AI APIs (configured via .env — AI_*/AI2_*/AI3_*) which each
+to up to 2 AI APIs (configured via .env — AI_*/AI2_*) which each
 return a scalping analysis; use --no-ai to skip that step and only produce
 the report for manual copying (e.g. into ChatGPT). Results are printed to
 the terminal, saved as text, and rendered into an HTML comparison dashboard.
@@ -167,8 +167,8 @@ def main() -> int:
     configured_models = [m for m in config.AI_MODELS if m.api_key]
     if not configured_models:
         console.print(
-            "[bold red]Ни для одной модели не задан API-ключ в .env (AI_API_KEY / AI2_API_KEY / "
-            "AI3_API_KEY). Укажите хотя бы один ключ или запустите с флагом --no-ai.[/bold red]"
+            "[bold red]Ни для одной модели не задан API-ключ в .env (AI_API_KEY / "
+            "AI2_API_KEY). Укажите хотя бы один ключ или запустите с флагом --no-ai.[/bold red]"
         )
         return 1
 
