@@ -11,6 +11,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Literal
 
+import config
 from ai_schema import TradePlan
 
 Severity = Literal["reject", "warning"]
@@ -19,6 +20,18 @@ Severity = Literal["reject", "warning"]
 # worse than 1:1.5) — scalping gets a lighter floor since stops are tight
 # and held for minutes, not hours.
 MIN_RISK_REWARD = {"scalping": 1.0, "swing": 1.5}
+
+# Round-trip commission (config.TRADING_COMMISSION_PCT, paid on both entry
+# and exit — the same 2 * commission_pct term outcome_simulator.py deducts
+# when scoring a resolved prediction) is a flat cost in price terms
+# regardless of how tight the stop is: the tighter the stop, the bigger a
+# bite it takes out of one R. A plan where fees alone would already eat
+# more than half the risk unit is a fee-drag loser even before price moves
+# — this is exactly the pattern that made NeuroTrade-claude's early
+# scalping results look profitable on win-rate (>50%) but run negative on
+# expectancy: its stops were tight enough that commission ate 0.4-0.75R out
+# of every trade.
+MAX_COMMISSION_RISK_FRACTION = 0.5
 
 # How far (in ATR multiples) an entry may sit from the current price before
 # it's considered stale/unreachable, and how tight/wide a stop may be.
@@ -158,6 +171,16 @@ def _validate_directional(plan: TradePlan, mode: str, ctx: ValidationContext) ->
                     _reject(
                         "RR_TOO_LOW",
                         f"R:R до TP1 ({computed_rr:.2f}) ниже минимального для режима ({min_rr:.1f}).",
+                    )
+                )
+
+            commission_r = (2 * config.TRADING_COMMISSION_PCT * entry_mid) / risk
+            if commission_r > MAX_COMMISSION_RISK_FRACTION:
+                issues.append(
+                    _reject(
+                        "STOP_TOO_TIGHT_FOR_FEES",
+                        f"Комиссия съедает {commission_r:.0%} риска — стоп слишком узкий "
+                        f"относительно цены (максимум {MAX_COMMISSION_RISK_FRACTION:.0%}).",
                     )
                 )
 

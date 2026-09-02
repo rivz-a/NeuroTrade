@@ -16,11 +16,11 @@ def _base_plan(**overrides) -> TradePlan:
         confidence=65,
         market_regime="TREND_UP",
         entry=EntryZone(type="LIMIT_ZONE", from_=1776.80, to=1777.20, trigger="x"),
-        stop_loss=1774.80,
+        stop_loss=1772.00,
         take_profits=[
-            TakeProfit(label="TP1", price=1779.20, close_percent=40),
-            TakeProfit(label="TP2", price=1781.00, close_percent=35),
-            TakeProfit(label="TP3", price=1785.00, close_percent=25),
+            TakeProfit(label="TP1", price=1784.00, close_percent=40),
+            TakeProfit(label="TP2", price=1787.00, close_percent=35),
+            TakeProfit(label="TP3", price=1792.00, close_percent=25),
         ],
         time_horizon_minutes=30,
         valid_for_minutes=15,
@@ -92,6 +92,20 @@ def test_stop_too_tight_warns():
     plan = _base_plan(stop_loss=1776.79)  # ~0.1 ATR from entry mid with atr=2.0
     result = validate_trade_plan(plan, "scalping", _ctx(atr=2.0))
     assert any(i.code == "STOP_TOO_TIGHT" for i in result.issues)
+
+
+def test_stop_too_tight_for_fees_rejected():
+    # risk=0.30 clears the ATR floor (0.30/1.0 = 0.3 > MIN_STOP_DISTANCE_ATR)
+    # but commission (2 * 0.05% * ~1777 =~ 1.78) alone is ~6x the risk unit —
+    # a plan the ATR-based STOP_TOO_TIGHT check alone would miss.
+    plan = _base_plan(
+        stop_loss=1776.70,
+        take_profits=[TakeProfit(label="TP1", price=1777.60, close_percent=100)],
+    )
+    result = validate_trade_plan(plan, "scalping", _ctx(atr=1.0))
+    assert result.status == "rejected"
+    assert any(i.code == "STOP_TOO_TIGHT_FOR_FEES" for i in result.issues)
+    assert not any(i.code == "STOP_TOO_TIGHT" for i in result.issues)
 
 
 def test_entry_too_far_warns():
