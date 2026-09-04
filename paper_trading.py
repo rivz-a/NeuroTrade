@@ -797,7 +797,7 @@ def compute_paper_trading_statistics(conn, *, mode: str, window_start: float, wi
     rows = conn.execute(
         """
         SELECT
-            po.id AS paper_order_id, po.created_at AS order_created_at,
+            po.id AS paper_order_id, po.created_at AS order_created_at, po.status AS order_status,
             tp.id AS trade_plan_id, tp.source_label,
             ss.ruleset_version, ss.decision, ss.regime,
             tout.status AS outcome_status, tout.r_multiple, tout.mfe_r, tout.mae_r,
@@ -819,6 +819,13 @@ def compute_paper_trading_statistics(conn, *, mode: str, window_start: float, wi
     regime_records: dict[str, list[dict]] = {}
 
     for row in rows:
+        # An order that expired without ever filling never became a real
+        # trade attempt (EXPIRED is only set when filled_quantity <= 0 — see
+        # _expire_order_if_due) — same treatment as a WAIT signal that never
+        # got an order at all, so it must not inflate "still open/in
+        # progress" (total - evaluated) forever.
+        if row["order_status"] == "EXPIRED":
+            continue
         model_key = row["source_label"]
         strategy_key = (row["ruleset_version"], row["decision"])
         regime_key = row["regime"]

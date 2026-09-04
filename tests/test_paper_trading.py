@@ -1007,6 +1007,20 @@ def test_compute_statistics_pending_trade_counts_in_total_not_evaluated(conn):
     assert evaluated == 0
 
 
+def test_compute_statistics_expired_unfilled_order_excluded_from_total(conn):
+    """An order that expired without ever filling (price never touched the
+    entry zone) never became a real trade attempt -- it must not inflate
+    "still open" (total - evaluated) forever, since it can never gain a
+    trade_outcome to move it into evaluated.
+    """
+    plan_id = _open_trade_plan(conn, signal="LONG")
+    order_id = paper_trading.open_virtual_order(conn, plan_id, now=NOW_EPOCH).order_id
+    journal_db.update_order_status(conn, "paper_orders", order_id, "EXPIRED", now=NOW_EPOCH + 900)
+    stats = paper_trading.compute_paper_trading_statistics(conn, mode="scalping", window_start=NOW_EPOCH - 10, window_end=NOW_EPOCH + 3600)
+    total = sum(b.total for b in stats.by_model.values())
+    assert total == 0
+
+
 def test_refresh_statistics_persists_rows_with_correct_regime_decision_split(conn):
     _finalize_synthetic_outcome(conn, r_multiple=1.0, regime="TREND_UP", ruleset_version="v1", decision="LONG_BIAS")
     result = paper_trading.refresh_statistics(conn, mode="scalping", window_start=NOW_EPOCH - 10, window_end=NOW_EPOCH + 3600)
