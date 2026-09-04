@@ -102,7 +102,7 @@ def run_ai_cycle(conn, symbol: str, mode: str, *, now: float | None = None) -> A
         conn,
         service_result.consensus,
         strategy_score_id=score_id,
-        symbol=bingx_symbol,
+        symbol=symbol,
         timestamp=now,
         calculation=service_result.calculation,
         bingx_fields=service_result.bingx_fields,
