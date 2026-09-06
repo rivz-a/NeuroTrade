@@ -21,12 +21,15 @@ counter, which would drift if a tick ever takes longer than usual):
     refactor across Stages 11-12 was out of scope here); running them less
     often keeps the extra BingX calls low without touching that code.
   - AI_CYCLE: runtime/ai_cycle.py, cycled independently for EVERY trading
-    mode (scalping AND swing) on that mode's own cadence — the configured
-    primary mode (config.TRADING_MODE) uses config.RUNTIME_AI_CYCLE_INTERVAL_
-    SECONDS (its own prediction horizon, or an env override); any other mode
-    uses its own PREDICTION_HORIZON_SECONDS directly, so a multi-hour swing
-    setup isn't re-asked every 30 minutes just because scalping is. Each
-    mode's cycle: fetch fresh data, ask the AI, and open a paper position if
+    mode (scalping AND swing) on its own cadence — the configured primary
+    mode (config.TRADING_MODE) uses config.RUNTIME_AI_CYCLE_INTERVAL_SECONDS
+    (its own prediction horizon, or an env override); any other mode uses
+    config.RUNTIME_SECONDARY_MODE_CYCLE_INTERVAL_SECONDS (2h default) rather
+    than its own (much longer) prediction horizon, so a setup that develops
+    between checks isn't missed just because the last signal's horizon
+    hasn't elapsed — a rejected/WAIT signal has nothing "in flight" to wait
+    out. Each mode's cycle: fetch fresh data, ask the AI, and open a paper
+    position if
     the consensus is actionable. RUNTIME_MODE="PAPER" only, and every mode
     is skipped (without consuming/advancing its own interval) while a
     pending/open PAPER order already exists for the symbol — the "one order
@@ -187,12 +190,16 @@ class TradingRuntime:
             for mode in sorted(config.VALID_TRADING_MODES):
                 # The configured primary mode keeps its existing, overridable
                 # cadence (RUNTIME_AI_CYCLE_INTERVAL_SECONDS); any other mode
-                # cycled alongside it uses its own prediction horizon so a
-                # multi-hour swing setup isn't re-asked every 30 minutes.
+                # cycled alongside it uses RUNTIME_SECONDARY_MODE_CYCLE_
+                # INTERVAL_SECONDS -- deliberately NOT that mode's own (much
+                # longer) prediction horizon, so a setup that develops between
+                # checks isn't missed just because the last signal's horizon
+                # hasn't elapsed yet (a rejected/WAIT signal has nothing "in
+                # flight" to wait out).
                 interval = (
                     config.RUNTIME_AI_CYCLE_INTERVAL_SECONDS
                     if mode == config.TRADING_MODE
-                    else config.PREDICTION_HORIZON_SECONDS.get(mode, config.RUNTIME_AI_CYCLE_INTERVAL_SECONDS)
+                    else config.RUNTIME_SECONDARY_MODE_CYCLE_INTERVAL_SECONDS
                 )
                 interval_elapsed = now - self._last_ai_cycle_run.get(mode, 0.0) >= interval
                 if not (triggered or interval_elapsed):

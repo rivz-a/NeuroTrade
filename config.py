@@ -316,6 +316,18 @@ RUNTIME_AI_CYCLE_INTERVAL_SECONDS = float(
         str(PREDICTION_HORIZON_SECONDS.get(TRADING_MODE, PREDICTION_HORIZON_SECONDS["scalping"])),
     )
 )
+# Cycle cadence for every OTHER trading mode alongside the primary one above
+# (currently just "swing" when TRADING_MODE="scalping", or vice versa) — see
+# TradingRuntime.run_once. Independent of that mode's own prediction horizon
+# on purpose: a rejected/WAIT signal has nothing "in flight" to wait out, so
+# checking back well before an 8h swing horizon elapses can still catch a
+# setup that wasn't there yet on the last check. Default 2h is a deliberate
+# middle ground between "check every scalping tick" (too many paid AI calls
+# for a mode whose setups don't change that fast) and "wait the full
+# horizon" (misses anything that develops in between).
+RUNTIME_SECONDARY_MODE_CYCLE_INTERVAL_SECONDS = float(
+    os.getenv("RUNTIME_SECONDARY_MODE_CYCLE_INTERVAL_SECONDS", str(2 * 3600))
+)
 # An AI cycle's 2 parallel model calls (up to AI_REQUEST_TIMEOUT each) plus
 # the rest of the pipeline can legitimately block run_once() far longer
 # than RUNTIME_HEARTBEAT_STALE_SECONDS — heartbeat_status() uses this wider

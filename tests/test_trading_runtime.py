@@ -249,8 +249,9 @@ def test_run_once_does_not_run_ai_cycle_in_monitor_only_mode(conn, monkeypatch):
 
 
 def test_run_once_respects_ai_cycle_interval(conn, monkeypatch):
-    # swing's own (much longer) horizon means it only fires on the cold-start
-    # tick in this test -- the interval under test here is scalping's.
+    # swing's own cadence (RUNTIME_SECONDARY_MODE_CYCLE_INTERVAL_SECONDS, 2h
+    # default) means it only fires on the cold-start tick in this test --
+    # the interval under test here is scalping's.
     monkeypatch.setattr(config, "RUNTIME_AI_CYCLE_INTERVAL_SECONDS", 1800.0)
     monkeypatch.setattr(market_data_engine, "collect_snapshot", lambda symbol, now=None: _snapshot("GOOD"))
     monkeypatch.setattr(paper_trading, "process_tick", lambda c, symbol, now=None: None)
@@ -314,7 +315,7 @@ def test_run_once_survives_ai_cycle_exception(conn, monkeypatch):
 
 
 def test_run_once_trigger_file_bypasses_the_interval(conn, monkeypatch):
-    # swing's own horizon is far longer than what's exercised here, so this
+    # swing's own cadence is far longer than what's exercised here, so this
     # test tracks scalping's calls specifically (same convention as
     # test_run_once_respects_ai_cycle_interval above).
     monkeypatch.setattr(config, "RUNTIME_AI_CYCLE_INTERVAL_SECONDS", 1800.0)
