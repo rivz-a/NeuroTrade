@@ -77,4 +77,5 @@ def heartbeat_status(
         "open_real_positions": heartbeat.get("open_real_positions"),
         "last_error": heartbeat.get("last_error"),
         "activity": heartbeat.get("activity"),
+        "next_ai_cycle_at": heartbeat.get("next_ai_cycle_at"),
     }

@@ -140,6 +140,33 @@ class TradingRuntime:
         )
         self._conn.commit()
 
+    def _ai_cycle_interval(self, mode: str) -> float:
+        """The configured primary mode keeps its existing, overridable
+        cadence (RUNTIME_AI_CYCLE_INTERVAL_SECONDS); any other mode cycled
+        alongside it uses RUNTIME_SECONDARY_MODE_CYCLE_INTERVAL_SECONDS --
+        deliberately NOT that mode's own (much longer) prediction horizon,
+        so a setup that develops between checks isn't missed just because
+        the last signal's horizon hasn't elapsed yet (a rejected/WAIT signal
+        has nothing "in flight" to wait out).
+        """
+        return (
+            config.RUNTIME_AI_CYCLE_INTERVAL_SECONDS
+            if mode == config.TRADING_MODE
+            else config.RUNTIME_SECONDARY_MODE_CYCLE_INTERVAL_SECONDS
+        )
+
+    def _next_ai_cycle_at(self) -> dict[str, float]:
+        """When each mode is next due for an AI cycle, per its own cadence --
+        surfaced on the heartbeat so a human (or the dashboard) can see when
+        to expect the next check, not just when the last one happened.
+        Purely schedule-based: a mode can still be delayed past this time if
+        the one-position-per-symbol slot is taken when it comes up.
+        """
+        return {
+            mode: self._last_ai_cycle_run.get(mode, 0.0) + self._ai_cycle_interval(mode)
+            for mode in sorted(config.VALID_TRADING_MODES)
+        }
+
     # -----------------------------------------------------------------
     # One tick
     # -----------------------------------------------------------------
@@ -188,19 +215,7 @@ class TradingRuntime:
         trigger_consumed = False
         if config.RUNTIME_MODE == "PAPER":
             for mode in sorted(config.VALID_TRADING_MODES):
-                # The configured primary mode keeps its existing, overridable
-                # cadence (RUNTIME_AI_CYCLE_INTERVAL_SECONDS); any other mode
-                # cycled alongside it uses RUNTIME_SECONDARY_MODE_CYCLE_
-                # INTERVAL_SECONDS -- deliberately NOT that mode's own (much
-                # longer) prediction horizon, so a setup that develops between
-                # checks isn't missed just because the last signal's horizon
-                # hasn't elapsed yet (a rejected/WAIT signal has nothing "in
-                # flight" to wait out).
-                interval = (
-                    config.RUNTIME_AI_CYCLE_INTERVAL_SECONDS
-                    if mode == config.TRADING_MODE
-                    else config.RUNTIME_SECONDARY_MODE_CYCLE_INTERVAL_SECONDS
-                )
+                interval = self._ai_cycle_interval(mode)
                 interval_elapsed = now - self._last_ai_cycle_run.get(mode, 0.0) >= interval
                 if not (triggered or interval_elapsed):
                     continue
@@ -234,6 +249,7 @@ class TradingRuntime:
                     open_real_positions=len(open_real),
                     last_error=errors[-1] if errors else None,
                     activity="ai_cycle",
+                    next_ai_cycle_at=self._next_ai_cycle_at(),
                 )
                 try:
                     ai_cycle_results[mode] = ai_cycle.run_ai_cycle(self._conn, self.symbol, mode, now=now)
@@ -255,6 +271,7 @@ class TradingRuntime:
             open_paper_positions=len(open_paper),
             open_real_positions=len(open_real),
             last_error=errors[-1] if errors else None,
+            next_ai_cycle_at=self._next_ai_cycle_at(),
         )
 
         return RuntimeTickResult(

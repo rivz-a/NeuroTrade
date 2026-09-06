@@ -216,6 +216,11 @@ def _runtime_heartbeat_text(status: dict) -> str:
         if paper is not None or real is not None:
             parts.append(f"{paper if paper is not None else '?'} paper / {real if real is not None else '?'} real")
         parts.append(f"тик {int(age)}с назад")
+        next_at = status.get("next_ai_cycle_at") or {}
+        if next_at:
+            now = time.time()
+            next_parts = [f"{m}: {format_remaining(ts - now)}" for m, ts in sorted(next_at.items())]
+            parts.append("след. цикл — " + ", ".join(next_parts))
         return " · ".join(parts)
     if state == "stale":
         age = status.get("age_seconds")
@@ -2511,6 +2516,21 @@ def build_dashboard(
   var TRADING_MODE = {config.TRADING_MODE!r};
   var tradingModeBaselineUpdatedAt = null;
 
+  function formatRemainingJs(seconds) {{
+    // JS twin of signal_freshness.format_remaining -- keep the two in sync.
+    if (seconds == null) return 'н/д';
+    if (seconds <= 0) {{
+      var age = -seconds;
+      if (age < 60) return 'истёк ' + Math.round(age) + ' с назад';
+      var ageMinutes = age / 60;
+      if (ageMinutes < 90) return 'истёк ' + Math.round(ageMinutes) + ' мин назад';
+      return 'истёк ' + (ageMinutes / 60).toFixed(1) + ' ч назад';
+    }}
+    var minutes = seconds / 60;
+    if (minutes < 90) return 'осталось ' + Math.round(minutes) + ' мин';
+    return 'осталось ' + (minutes / 60).toFixed(1) + ' ч';
+  }}
+
   function formatRuntimeHeartbeat(status) {{
     if (!status || status.state === 'unknown') return 'Runtime: нет данных';
     if (status.state === 'stale') {{
@@ -2525,6 +2545,14 @@ def build_dashboard(
       parts.push(paper + ' paper / ' + real + ' real');
     }}
     parts.push('тик ' + Math.floor(status.age_seconds || 0) + 'с назад');
+    var nextAt = status.next_ai_cycle_at;
+    if (nextAt) {{
+      var now = Date.now() / 1000;
+      var nextParts = Object.keys(nextAt).sort().map(function (m) {{
+        return m + ': ' + formatRemainingJs(nextAt[m] - now);
+      }});
+      if (nextParts.length) parts.push('след. цикл — ' + nextParts.join(', '));
+    }}
     return parts.join(' · ');
   }}
 
