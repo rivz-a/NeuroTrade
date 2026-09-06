@@ -176,6 +176,9 @@ def test_run_once_survives_process_tick_exception(conn, monkeypatch):
 
 
 def test_run_once_runs_ai_cycle_on_first_tick_when_nothing_open(conn, monkeypatch):
+    # Every trading mode is cycled independently -- on a cold start (nothing
+    # ever ran, nothing open), both scalping and swing are due in the same
+    # tick, sorted alphabetically.
     monkeypatch.setattr(market_data_engine, "collect_snapshot", lambda symbol, now=None: _snapshot("GOOD"))
     monkeypatch.setattr(paper_trading, "process_tick", lambda c, symbol, now=None: None)
     calls = []
@@ -189,9 +192,10 @@ def test_run_once_runs_ai_cycle_on_first_tick_when_nothing_open(conn, monkeypatc
     runtime = TradingRuntime("ETHUSDT", conn=conn)
     result = runtime.run_once(now=NOW)
 
-    assert calls == [("ETHUSDT", config.TRADING_MODE)]
-    assert result.ai_cycle_result.ran is True
-    assert result.ai_cycle_result.trade_plan_id == 1
+    assert calls == [("ETHUSDT", "scalping"), ("ETHUSDT", "swing")]
+    assert result.ai_cycle_results.keys() == {"scalping", "swing"}
+    assert result.ai_cycle_results["scalping"].ran is True
+    assert result.ai_cycle_results["scalping"].trade_plan_id == 1
 
 
 def test_run_once_skips_ai_cycle_when_open_paper_position_exists(conn, monkeypatch):
@@ -208,7 +212,7 @@ def test_run_once_skips_ai_cycle_when_open_paper_position_exists(conn, monkeypat
 
     runtime = TradingRuntime("ETHUSDT", conn=conn)
     result = runtime.run_once(now=NOW)
-    assert result.ai_cycle_result is None
+    assert result.ai_cycle_results == {}
     assert result.errors == []
 
 
@@ -227,7 +231,7 @@ def test_run_once_skips_ai_cycle_when_pending_paper_order_exists(conn, monkeypat
 
     runtime = TradingRuntime("ETHUSDT", conn=conn)
     result = runtime.run_once(now=NOW)
-    assert result.ai_cycle_result is None
+    assert result.ai_cycle_results == {}
 
 
 def test_run_once_does_not_run_ai_cycle_in_monitor_only_mode(conn, monkeypatch):
@@ -241,28 +245,31 @@ def test_run_once_does_not_run_ai_cycle_in_monitor_only_mode(conn, monkeypatch):
 
     runtime = TradingRuntime("ETHUSDT", conn=conn)
     result = runtime.run_once(now=NOW)
-    assert result.ai_cycle_result is None
+    assert result.ai_cycle_results == {}
 
 
 def test_run_once_respects_ai_cycle_interval(conn, monkeypatch):
+    # swing's own (much longer) horizon means it only fires on the cold-start
+    # tick in this test -- the interval under test here is scalping's.
     monkeypatch.setattr(config, "RUNTIME_AI_CYCLE_INTERVAL_SECONDS", 1800.0)
     monkeypatch.setattr(market_data_engine, "collect_snapshot", lambda symbol, now=None: _snapshot("GOOD"))
     monkeypatch.setattr(paper_trading, "process_tick", lambda c, symbol, now=None: None)
     calls = []
     monkeypatch.setattr(
         ai_cycle, "run_ai_cycle",
-        lambda c, symbol, mode, *, now=None: calls.append(now) or ai_cycle.AICycleResult(ran=True),
+        lambda c, symbol, mode, *, now=None: calls.append((mode, now)) or ai_cycle.AICycleResult(ran=True),
     )
 
     runtime = TradingRuntime("ETHUSDT", conn=conn)
-    runtime.run_once(now=NOW)  # first tick always runs it (elapsed since epoch 0 is huge)
-    assert calls == [NOW]
+    runtime.run_once(now=NOW)  # first tick always runs every mode (elapsed since epoch 0 is huge)
+    scalping_calls = [c for c in calls if c[0] == "scalping"]
+    assert scalping_calls == [("scalping", NOW)]
 
     runtime.run_once(now=NOW + 60)  # well within the 1800s interval
-    assert calls == [NOW]  # not called again
+    assert [c for c in calls if c[0] == "scalping"] == [("scalping", NOW)]  # not called again
 
     runtime.run_once(now=NOW + 1801)  # past the interval
-    assert calls == [NOW, NOW + 1801]
+    assert [c for c in calls if c[0] == "scalping"] == [("scalping", NOW), ("scalping", NOW + 1801)]
 
 
 def test_run_once_ai_cycle_writes_busy_heartbeat_before_running(conn, monkeypatch):
@@ -282,7 +289,9 @@ def test_run_once_ai_cycle_writes_busy_heartbeat_before_running(conn, monkeypatc
     runtime = TradingRuntime("ETHUSDT", conn=conn)
     runtime.run_once(now=NOW)
 
-    assert seen_activity == ["ai_cycle"]
+    # both modes fire on this cold-start tick, each writing its own
+    # in-flight "ai_cycle" heartbeat before the (mocked) call.
+    assert seen_activity == ["ai_cycle", "ai_cycle"]
     # the FINAL heartbeat (written after the cycle completes) no longer
     # carries the in-flight marker
     final_hb = read_heartbeat(config.RUNTIME_HEARTBEAT_FILE)
@@ -298,30 +307,35 @@ def test_run_once_survives_ai_cycle_exception(conn, monkeypatch):
 
     runtime = TradingRuntime("ETHUSDT", conn=conn)
     result = runtime.run_once(now=NOW)
-    assert any("ai_cycle failed" in e for e in result.errors)
-    assert result.ai_cycle_result is None
+    # one exception per mode -- a bad cycle for one mode must not stop the
+    # others from being attempted.
+    assert sum("ai_cycle failed" in e for e in result.errors) == 2
+    assert result.ai_cycle_results == {}
 
 
 def test_run_once_trigger_file_bypasses_the_interval(conn, monkeypatch):
+    # swing's own horizon is far longer than what's exercised here, so this
+    # test tracks scalping's calls specifically (same convention as
+    # test_run_once_respects_ai_cycle_interval above).
     monkeypatch.setattr(config, "RUNTIME_AI_CYCLE_INTERVAL_SECONDS", 1800.0)
     monkeypatch.setattr(market_data_engine, "collect_snapshot", lambda symbol, now=None: _snapshot("GOOD"))
     monkeypatch.setattr(paper_trading, "process_tick", lambda c, symbol, now=None: None)
     calls = []
     monkeypatch.setattr(
         ai_cycle, "run_ai_cycle",
-        lambda c, symbol, mode, *, now=None: calls.append(now) or ai_cycle.AICycleResult(ran=True),
+        lambda c, symbol, mode, *, now=None: calls.append((mode, now)) or ai_cycle.AICycleResult(ran=True),
     )
 
     runtime = TradingRuntime("ETHUSDT", conn=conn)
-    runtime.run_once(now=NOW)  # first tick always runs it regardless
-    assert calls == [NOW]
+    runtime.run_once(now=NOW)  # first tick always runs every mode regardless
+    assert [c for c in calls if c[0] == "scalping"] == [("scalping", NOW)]
 
     runtime.run_once(now=NOW + 60)  # well within the 1800s interval, no trigger
-    assert calls == [NOW]
+    assert [c for c in calls if c[0] == "scalping"] == [("scalping", NOW)]
 
     config.RUNTIME_AI_CYCLE_TRIGGER_FILE.touch()
     runtime.run_once(now=NOW + 120)  # still within the interval, but triggered
-    assert calls == [NOW, NOW + 120]
+    assert [c for c in calls if c[0] == "scalping"] == [("scalping", NOW), ("scalping", NOW + 120)]
 
 
 def test_run_once_trigger_file_is_consumed_after_use(conn, monkeypatch):

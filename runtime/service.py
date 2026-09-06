@@ -20,20 +20,28 @@ counter, which would drift if a tick ever takes longer than usual):
     own price internally (see the plan for why a full price-injection
     refactor across Stages 11-12 was out of scope here); running them less
     often keeps the extra BingX calls low without touching that code.
-  - AI_CYCLE (config.RUNTIME_AI_CYCLE_INTERVAL_SECONDS, default = this
-    process's trading mode's own prediction horizon): runtime/ai_cycle.py —
-    fetch fresh data, ask the AI, and open a paper position if the
-    consensus is actionable. RUNTIME_MODE="PAPER" only, and skipped
-    (without consuming/advancing the interval) while a pending/open PAPER
-    order already exists for the symbol, so this app never stacks more
-    than one paper position at a time the same way the plan for eventual
-    real trading insists on ("один ордер одновременно"). Also fires
-    immediately, interval or not, when config.RUNTIME_AI_CYCLE_TRIGGER_FILE
-    exists — server.py's dashboard "Обновить" button for this trading mode
-    touches that file instead of paying for its own separate AI call, so
-    the runtime (which already pays for this mode's analysis on its own
-    schedule) stays the single source of truth instead of two independent
-    paid AI-call paths existing side by side.
+  - AI_CYCLE: runtime/ai_cycle.py, cycled independently for EVERY trading
+    mode (scalping AND swing) on that mode's own cadence — the configured
+    primary mode (config.TRADING_MODE) uses config.RUNTIME_AI_CYCLE_INTERVAL_
+    SECONDS (its own prediction horizon, or an env override); any other mode
+    uses its own PREDICTION_HORIZON_SECONDS directly, so a multi-hour swing
+    setup isn't re-asked every 30 minutes just because scalping is. Each
+    mode's cycle: fetch fresh data, ask the AI, and open a paper position if
+    the consensus is actionable. RUNTIME_MODE="PAPER" only, and every mode
+    is skipped (without consuming/advancing its own interval) while a
+    pending/open PAPER order already exists for the symbol — the "one order
+    at a time" invariant is shared ACROSS modes, not per mode, so this app
+    never stacks more than one paper position at a time on the same symbol
+    the same way the plan for eventual real trading insists on ("один ордер
+    одновременно"), even if e.g. scalping and swing both have an actionable
+    signal in the same tick (whichever is checked first, per
+    sorted(VALID_TRADING_MODES), claims the slot; the rest wait for it to
+    close). Also fires immediately, interval or not, for every mode at once
+    when config.RUNTIME_AI_CYCLE_TRIGGER_FILE exists — server.py's dashboard
+    "Обновить" button touches that file instead of paying for its own
+    separate AI call, so the runtime (which already pays for this analysis
+    on its own schedule) stays the single source of truth instead of two
+    independent paid AI-call paths existing side by side.
 
 execution_engine.confirm_and_execute (placing a NEW real order) is never
 called from here — that stays a separate, manual action. This runtime only
@@ -73,7 +81,7 @@ class RuntimeTickResult:
     market_data_quality: str | None
     paper_tick: paper_trading.TickResult | None
     real_monitor_ran: bool
-    ai_cycle_result: ai_cycle.AICycleResult | None = None
+    ai_cycle_results: dict[str, ai_cycle.AICycleResult] = field(default_factory=dict)
     errors: list[str] = field(default_factory=list)
 
 
@@ -83,7 +91,13 @@ class TradingRuntime:
         self._conn = conn if conn is not None else journal_db.init_db()
         self._lock_handle = None
         self._last_medium_run: float = 0.0
-        self._last_ai_cycle_run: float = 0.0
+        # Per mode: each trading mode (scalping/swing) is cycled on its own
+        # cadence -- scalping every RUNTIME_AI_CYCLE_INTERVAL_SECONDS (its
+        # own prediction horizon, or an env override), swing every
+        # PREDICTION_HORIZON_SECONDS["swing"] (8h by default) -- so asking
+        # about a multi-hour swing setup every 30 minutes doesn't burn AI
+        # calls for a plan that hasn't even had time to resolve yet.
+        self._last_ai_cycle_run: dict[str, float] = {}
 
     # -----------------------------------------------------------------
     # Startup recovery
@@ -166,20 +180,39 @@ class TradingRuntime:
         open_paper = journal_db.get_open_positions(self._conn, self.symbol, source="PAPER")
         open_real = journal_db.get_open_positions(self._conn, self.symbol, source="REAL")
 
-        ai_cycle_result: ai_cycle.AICycleResult | None = None
+        ai_cycle_results: dict[str, ai_cycle.AICycleResult] = {}
         triggered = config.RUNTIME_MODE == "PAPER" and config.RUNTIME_AI_CYCLE_TRIGGER_FILE.exists()
-        interval_elapsed = now - self._last_ai_cycle_run >= config.RUNTIME_AI_CYCLE_INTERVAL_SECONDS
-        if config.RUNTIME_MODE == "PAPER" and (triggered or interval_elapsed):
-            pending_paper_orders = journal_db.get_pending_paper_orders(self._conn, self.symbol)
-            if not pending_paper_orders and not open_paper:
-                if triggered:
+        trigger_consumed = False
+        if config.RUNTIME_MODE == "PAPER":
+            for mode in sorted(config.VALID_TRADING_MODES):
+                # The configured primary mode keeps its existing, overridable
+                # cadence (RUNTIME_AI_CYCLE_INTERVAL_SECONDS); any other mode
+                # cycled alongside it uses its own prediction horizon so a
+                # multi-hour swing setup isn't re-asked every 30 minutes.
+                interval = (
+                    config.RUNTIME_AI_CYCLE_INTERVAL_SECONDS
+                    if mode == config.TRADING_MODE
+                    else config.PREDICTION_HORIZON_SECONDS.get(mode, config.RUNTIME_AI_CYCLE_INTERVAL_SECONDS)
+                )
+                interval_elapsed = now - self._last_ai_cycle_run.get(mode, 0.0) >= interval
+                if not (triggered or interval_elapsed):
+                    continue
+                pending_paper_orders = journal_db.get_pending_paper_orders(self._conn, self.symbol)
+                if pending_paper_orders or open_paper:
+                    # The one-position-per-symbol slot is taken (by this tick's
+                    # own earlier mode, or from before) — every remaining mode
+                    # waits, same as the original single-mode gate. A pending
+                    # trigger stays queued (not consumed) until a slot is free.
+                    break
+                if triggered and not trigger_consumed:
                     try:
                         config.RUNTIME_AI_CYCLE_TRIGGER_FILE.unlink()
                     except OSError:
                         pass
-                self._last_ai_cycle_run = now
+                    trigger_consumed = True
+                self._last_ai_cycle_run[mode] = now
                 # An AI cycle can block for up to ~AI_REQUEST_TIMEOUT seconds
-                # (all 3 models run in parallel, but that's still far past
+                # (all models run in parallel, but that's still far past
                 # RUNTIME_HEARTBEAT_STALE_SECONDS) — write a heartbeat NOW,
                 # tagged "ai_cycle", so heartbeat_status() applies the wider
                 # busy-stale budget instead of flagging this as a hang.
@@ -196,11 +229,12 @@ class TradingRuntime:
                     activity="ai_cycle",
                 )
                 try:
-                    ai_cycle_result = ai_cycle.run_ai_cycle(self._conn, self.symbol, config.TRADING_MODE, now=now)
+                    ai_cycle_results[mode] = ai_cycle.run_ai_cycle(self._conn, self.symbol, mode, now=now)
                     self._conn.commit()
                 except Exception as exc:  # best-effort, same as paper tick/monitor above
-                    errors.append(f"ai_cycle failed: {exc}")
-                # A just-opened paper position changes both counts below.
+                    errors.append(f"ai_cycle failed ({mode}): {exc}")
+                # A just-opened paper position changes both counts below, and
+                # must be visible to the next mode's gate check in this loop.
                 open_paper = journal_db.get_open_positions(self._conn, self.symbol, source="PAPER")
                 open_real = journal_db.get_open_positions(self._conn, self.symbol, source="REAL")
 
@@ -220,7 +254,7 @@ class TradingRuntime:
             market_data_quality=data_quality,
             paper_tick=paper_tick_result,
             real_monitor_ran=real_monitor_ran,
-            ai_cycle_result=ai_cycle_result,
+            ai_cycle_results=ai_cycle_results,
             errors=errors,
         )
 
